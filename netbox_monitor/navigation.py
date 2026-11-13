@@ -10,6 +10,10 @@ menu = PluginMenu(
                     link='plugins:netbox_monitor:monitor',
                     link_text='Visão Geral',
                 ),
+                PluginMenuItem(
+                    link='plugins:netbox_monitor:settings',
+                    link_text='Configurações',
+                ),
             ),
         ),
     ),

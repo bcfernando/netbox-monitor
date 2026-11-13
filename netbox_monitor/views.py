@@ -1,19 +1,26 @@
 import re
+from datetime import timedelta
 
 from django.apps import apps
 from django.contrib import messages
+from django.contrib.auth.mixins import LoginRequiredMixin
+from django.core.exceptions import PermissionDenied
+from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
+from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.views import View
 
-from dcim.models import Device
+from dcim.models import Device, Interface
+from ipam.models import VLAN
 from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
 
-from .jobs import DeviceMonitorJob
-from .models import DeviceMetric
+from .forms import MonitorSettingsForm
+from .jobs import DeviceMonitorJob, collect_device, save_metric, send_webhook_alert
+from .models import DeviceMetric, MonitorSettings
 
 _VIRTUAL_INTERFACE_RE = re.compile(
     r'(?:^|[^a-z])(?:loopback|lo|vlan|null|mgmt|trk|port-channel)\d*(?:[^a-z]|$)',
@@ -24,6 +31,11 @@ _SFP_INTERFACE_RE = re.compile(
     re.IGNORECASE,
 )
 _FACEPLATE_GROUP_SIZE = 6
+
+_SYNC_SFP_INTERFACE_RE = re.compile(
+    r'(?:sfp|ten|25g|40g)',
+    re.IGNORECASE,
+)
 
 _VENDOR_THEMES = (
     ('aruba', ('aruba', 'instant on')),
@@ -43,6 +55,19 @@ _VENDOR_LABELS = {
 }
 
 _VENDOR_CONSOLE_THEMES = {'aruba', 'hpe', 'cisco'}
+
+_RANGE_OPTIONS = (
+    ('1h', timedelta(hours=1), 'última 1 hora'),
+    ('6h', timedelta(hours=6), 'últimas 6 horas'),
+    ('24h', timedelta(hours=24), 'últimas 24 horas'),
+    ('7d', timedelta(days=7), 'últimos 7 dias'),
+    ('30d', timedelta(days=30), 'últimos 30 dias'),
+)
+_RANGE_MAP = {key: (delta, label) for key, delta, label in _RANGE_OPTIONS}
+_DEFAULT_RANGE = '1h'
+_MAX_CHART_POINTS = 60
+_INCIDENT_WINDOW = timedelta(hours=24)
+_INCIDENT_LIMIT = 10
 
 
 def _bandwidth_mbps(previous, current, interval):
@@ -89,6 +114,160 @@ def _interfaces_with_rates(latest, previous):
     return rows
 
 
+def _aggregate_traffic(interface_rows):
+    total = 0.0
+    has_value = False
+    for row in interface_rows or []:
+        download = row.get('download_mbps')
+        upload = row.get('upload_mbps')
+        if download is not None:
+            total += float(download)
+            has_value = True
+        if upload is not None:
+            total += float(upload)
+            has_value = True
+    if not has_value:
+        return None
+    return round(total, 3)
+
+
+def _traffic_series(metrics):
+    values = []
+    previous = None
+    for metric in metrics:
+        if previous is None:
+            values.append(None)
+        else:
+            values.append(_aggregate_traffic(_interfaces_with_rates(metric, previous)))
+        previous = metric
+    return values
+
+
+def _format_uptime(metric):
+    if metric is None or metric.uptime_seconds is None:
+        return '-'
+    return metric.uptime_display or '-'
+
+
+def _loop_flag(metric):
+    if metric is None or not isinstance(metric.loop_status, dict):
+        return None
+    return bool(metric.loop_status.get('has_alert'))
+
+
+def _build_recent_incidents(devices, since, limit=_INCIDENT_LIMIT):
+    metrics = (
+        DeviceMetric.objects.filter(device__in=devices)
+        .select_related('device')
+        .order_by('device_id', 'timestamp')
+    )
+
+    prior = {
+        metric.device_id: metric
+        for metric in metrics.filter(timestamp__lt=since)
+        .order_by('device_id', '-timestamp')
+        .distinct('device_id')
+    }
+
+    events = []
+    current_device = None
+    previous = None
+
+    for metric in metrics.filter(timestamp__gte=since):
+        if metric.device_id != current_device:
+            current_device = metric.device_id
+            previous = prior.get(metric.device_id)
+
+        if previous is not None:
+            was_online = bool(previous.is_online)
+            is_online = bool(metric.is_online)
+
+            if was_online and not is_online:
+                events.append({
+                    'device': metric.device,
+                    'timestamp': metric.timestamp,
+                    'event_type': 'OFFLINE',
+                    'badge_class': 'text-bg-danger',
+                    'description': 'Equipamento ficou offline (ONLINE → OFFLINE).',
+                })
+            elif not was_online and is_online:
+                events.append({
+                    'device': metric.device,
+                    'timestamp': metric.timestamp,
+                    'event_type': 'ONLINE',
+                    'badge_class': 'text-bg-success',
+                    'description': 'Conectividade restabelecida (OFFLINE → ONLINE).',
+                })
+
+            if _loop_flag(metric) and not _loop_flag(previous):
+                loop_status = metric.loop_status or {}
+                events.append({
+                    'device': metric.device,
+                    'timestamp': metric.timestamp,
+                    'event_type': 'LOOP / STP',
+                    'badge_class': 'text-bg-warning',
+                    'description': loop_status.get('reason')
+                    or 'Possível loop de rede / alteração STP detectada.',
+                })
+
+        previous = metric
+
+    events.sort(key=lambda event: event['timestamp'], reverse=True)
+    return events[:limit]
+
+
+def _downsample(items, limit=_MAX_CHART_POINTS):
+    total = len(items)
+    if total <= limit:
+        return items
+    step = (total - 1) / (limit - 1)
+    indices = sorted({round(index * step) for index in range(limit)})
+    return [items[index] for index in indices]
+
+
+def _port_history_series(metrics):
+    names = set()
+    for metric in metrics:
+        for interface in metric.interfaces_summary or []:
+            name = (interface.get('name') or '').strip()
+            if name:
+                names.add(name)
+
+    ordered = sorted(names, key=_natural_sort_key)
+    ports = {
+        name: {'download': [None] * len(metrics), 'upload': [None] * len(metrics)}
+        for name in ordered
+    }
+
+    previous = None
+    for index, metric in enumerate(metrics):
+        if previous is not None:
+            interval = (metric.timestamp - previous.timestamp).total_seconds()
+            if interval > 0:
+                previous_by_name = {
+                    (item.get('name') or '').strip(): item
+                    for item in previous.interfaces_summary or []
+                }
+                for interface in metric.interfaces_summary or []:
+                    name = (interface.get('name') or '').strip()
+                    entry = ports.get(name)
+                    prev = previous_by_name.get(name)
+                    if entry is None or prev is None:
+                        continue
+                    entry['download'][index] = _bandwidth_mbps(
+                        prev.get('in_octets'), interface.get('in_octets'), interval
+                    )
+                    entry['upload'][index] = _bandwidth_mbps(
+                        prev.get('out_octets'), interface.get('out_octets'), interval
+                    )
+        previous = metric
+
+    return {
+        'labels': [m.timestamp.strftime('%d/%m %H:%M:%S') for m in metrics],
+        'ports': ports,
+    }
+
+
 def _natural_sort_key(value):
     return [
         int(part) if part.isdigit() else part.lower()
@@ -101,6 +280,16 @@ def _port_number(name, fallback):
     if matches:
         return str(int(matches[-1]))
     return str(fallback)
+
+
+def _sync_interface_type(port_name):
+    name = (port_name or '').strip()
+    if _SYNC_SFP_INTERFACE_RE.search(name):
+        return '10gbase-x-sfpp'
+    numbers = re.findall(r'\d+', name)
+    if numbers and int(numbers[-1]) > 48:
+        return '10gbase-x-sfpp'
+    return '1000base-t'
 
 
 def _format_rate(value):
@@ -250,18 +439,41 @@ class MonitorView(View):
             .distinct('device_id')
         }
 
+        previous_metrics = {
+            metric.device_id: metric
+            for metric in DeviceMetric.objects.filter(device__in=devices)
+            .exclude(pk__in=[metric.pk for metric in latest_metrics.values()])
+            .order_by('device_id', '-timestamp')
+            .distinct('device_id')
+        }
+
         rows = []
         for device in devices:
             metric = latest_metrics.get(device.pk)
+            previous = previous_metrics.get(device.pk)
+            interface_rows = _interfaces_with_rates(metric, previous)
+
             rows.append({
                 'device': device,
                 'ip': str(device.primary_ip.address).split('/')[0] if device.primary_ip else '',
                 'metric': metric,
                 'is_online': bool(metric and metric.is_online),
                 'has_latency': bool(metric and metric.latency_ms is not None),
+                'uptime': _format_uptime(metric),
+                'active_ports': sum(
+                    1 for row in interface_rows
+                    if (row.get('status') or '').upper() == 'UP'
+                ),
+                'total_ports': len(interface_rows),
+                'traffic_total': _aggregate_traffic(interface_rows),
+                'stp_alert': _loop_flag(metric),
             })
 
         online = sum(1 for row in rows if row['is_online'])
+        incidents = _build_recent_incidents(
+            devices,
+            timezone.now() - _INCIDENT_WINDOW,
+        )
 
         return render(
             request,
@@ -273,8 +485,67 @@ class MonitorView(View):
                 'total': len(rows),
                 'online': online,
                 'offline': len(rows) - online,
+                'incidents': incidents,
             },
         )
+
+
+class MonitorSettingsView(LoginRequiredMixin, View):
+    template_name = 'netbox_monitor/settings.html'
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.user.is_authenticated and not (
+            request.user.is_superuser
+            or request.user.has_perm('netbox_monitor.change_monitorsettings')
+        ):
+            raise PermissionDenied
+        return super().dispatch(request, *args, **kwargs)
+
+    def get(self, request):
+        form = MonitorSettingsForm(instance=MonitorSettings.get_solo())
+        return render(request, self.template_name, {'form': form})
+
+    def post(self, request):
+        settings_obj = MonitorSettings.get_solo()
+        form = MonitorSettingsForm(request.POST, instance=settings_obj)
+
+        if not form.is_valid():
+            messages.error(
+                request,
+                _('Não foi possível salvar as configurações. Verifique os campos.'),
+            )
+            return render(request, self.template_name, {'form': form})
+
+        form.save()
+
+        if request.POST.get('action') == 'test':
+            sent = send_webhook_alert(
+                '🔔 Teste de alerta do NetBox Monitor realizado com sucesso!'
+            )
+            if sent:
+                messages.success(
+                    request,
+                    _('Teste de alerta enviado com sucesso.'),
+                )
+            elif not settings_obj.enabled:
+                messages.error(
+                    request,
+                    _('Os alertas estão desativados. Ative-os para testar.'),
+                )
+            elif not settings_obj.webhook_url:
+                messages.error(
+                    request,
+                    _('Configure a URL do webhook para enviar o teste.'),
+                )
+            else:
+                messages.error(
+                    request,
+                    _('Falha ao enviar o teste. Verifique a URL do webhook.'),
+                )
+        else:
+            messages.success(request, _('Configurações salvas com sucesso.'))
+
+        return redirect(reverse('plugins:netbox_monitor:settings'))
 
 
 @register_model_view(Device, 'monitor', path='monitor')
@@ -288,15 +559,42 @@ class DeviceMonitorView(generic.ObjectView):
     )
 
     def get_extra_context(self, request, instance):
+        range_key = request.GET.get('range', _DEFAULT_RANGE)
+        if range_key not in _RANGE_MAP:
+            range_key = _DEFAULT_RANGE
+        range_delta, range_label = _RANGE_MAP[range_key]
+
+        start = timezone.now() - range_delta
         metrics = list(
-            DeviceMetric.objects.filter(device=instance).order_by('-timestamp')[:24]
+            DeviceMetric.objects.filter(
+                device=instance,
+                timestamp__gte=start,
+            ).order_by('timestamp')
         )
-        metrics.reverse()
+        chart_metrics = _downsample(metrics)
         latest = metrics[-1] if metrics else None
         previous = metrics[-2] if len(metrics) > 1 else None
 
         interface_rows = _interfaces_with_rates(latest, previous)
         vendor_theme = _vendor_theme(instance, latest)
+
+        has_resource_data = latest is not None and (
+            latest.cpu_percent is not None or latest.memory_percent is not None
+        )
+        has_resource_history = any(
+            metric.cpu_percent is not None or metric.memory_percent is not None
+            for metric in chart_metrics
+        )
+        traffic_chart_values = _traffic_series(chart_metrics)
+        has_traffic_history = any(value is not None for value in traffic_chart_values)
+        port_history = _port_history_series(chart_metrics)
+
+        active_ports = sum(
+            1 for row in interface_rows
+            if (row.get('status') or '').upper() == 'UP'
+        )
+        total_ports = len(interface_rows)
+        total_traffic_mbps = _aggregate_traffic(interface_rows)
 
         vlans_summary = []
         loop_status = {}
@@ -309,13 +607,30 @@ class DeviceMonitorView(generic.ObjectView):
         return {
             'latest_metric': latest,
             'has_latency': latest is not None and latest.latency_ms is not None,
+            'range_key': range_key,
+            'range_label': range_label,
+            'range_options': [
+                {'key': key, 'label': key, 'active': key == range_key}
+                for key, _delta, _label in _RANGE_OPTIONS
+            ],
+            'port_history_json': port_history,
             'interface_rows': interface_rows,
             'vlans_summary': vlans_summary,
             'loop_status': loop_status,
-            'chart_labels': [m.timestamp.strftime('%d/%m %H:%M:%S') for m in metrics],
-            'chart_values': [m.latency_ms for m in metrics],
-            'cpu_chart_values': [m.cpu_percent for m in metrics],
-            'memory_chart_values': [m.memory_percent for m in metrics],
+            'chart_labels': [
+                m.timestamp.strftime('%d/%m %H:%M:%S') for m in chart_metrics
+            ],
+            'chart_values': [m.latency_ms for m in chart_metrics],
+            'cpu_chart_values': [m.cpu_percent for m in chart_metrics],
+            'memory_chart_values': [m.memory_percent for m in chart_metrics],
+            'traffic_chart_values': traffic_chart_values,
+            'has_resource_data': has_resource_data,
+            'has_resource_history': has_resource_history,
+            'has_traffic_history': has_traffic_history,
+            'show_traffic_chart': not has_resource_history and has_traffic_history,
+            'active_ports': active_ports,
+            'total_ports': total_ports,
+            'total_traffic_mbps': total_traffic_mbps,
             'chassis_model': _chassis_model(instance, latest),
             'vendor_theme': vendor_theme,
             'vendor_label': _VENDOR_LABELS.get(vendor_theme, 'Switch'),
@@ -324,24 +639,161 @@ class DeviceMonitorView(generic.ObjectView):
         }
 
 
+def _collect_now(device, ip, community):
+    data = collect_device(ip, community)
+    save_metric(device, data)
+    return data
+
+
 class CollectNowView(View):
     def post(self, request, pk):
         device = get_object_or_404(
             Device.objects.restrict(request.user, 'view'),
             pk=pk,
         )
-        job = DeviceMonitorJob.enqueue(
-            user=request.user,
-            name=f'Monitor {device}',
+        redirect_url = reverse('dcim:device_monitor', kwargs={'pk': device.pk})
+
+        if device.primary_ip is None:
+            messages.warning(
+                request,
+                _('{device} não possui IP primário configurado.').format(device=device),
+            )
+            return redirect(redirect_url)
+
+        ip = str(device.primary_ip.address).split('/')[0]
+        community = device.cf.get('snmp_community') or 'public'
+
+        try:
+            data = _collect_now(device, ip, community)
+        except Exception as exc:
+            messages.warning(
+                request,
+                _('Falha ao coletar {device}: {error}').format(
+                    device=device,
+                    error=exc,
+                ),
+            )
+        else:
+            status = 'ONLINE' if data.get('is_online') else 'OFFLINE'
+            messages.success(
+                request,
+                _('Coleta concluída para {device} ({status}).').format(
+                    device=device,
+                    status=status,
+                ),
+            )
+
+        return redirect(redirect_url)
+
+
+class SyncSnmpToNetboxView(LoginRequiredMixin, View):
+    http_method_names = ['post']
+
+    def post(self, request, pk):
+        device = get_object_or_404(
+            Device.objects.restrict(request.user, 'view'),
+            pk=pk,
         )
+        redirect_url = reverse('dcim:device_monitor', kwargs={'pk': device.pk})
+
+        metric = (
+            DeviceMetric.objects.filter(device=device)
+            .exclude(interfaces_summary=[])
+            .order_by('-timestamp')
+            .first()
+        )
+        if metric is None or not metric.interfaces_summary:
+            messages.warning(
+                request,
+                _(
+                    '{device} não possui coleta SNMP com interfaces. '
+                    'Execute uma coleta antes de sincronizar.'
+                ).format(device=device),
+            )
+            return redirect(redirect_url)
+
+        vlans_by_vid = {}
+        vlans_created = 0
+        vlans_existing = 0
+        interfaces_created = 0
+        interfaces_updated = 0
+
+        with transaction.atomic():
+            for item in metric.vlans_summary or []:
+                try:
+                    vid = int(item.get('vlan_id'))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+
+                vlan_name = (item.get('name') or '').strip() or f'VLAN {vid}'
+                vlan, created = VLAN.objects.get_or_create(
+                    vid=vid,
+                    site=device.site,
+                    defaults={'name': vlan_name},
+                )
+                vlans_by_vid[vid] = vlan
+                if created:
+                    vlans_created += 1
+                else:
+                    vlans_existing += 1
+
+            for item in metric.interfaces_summary or []:
+                port_name = str(item.get('name') or '').strip()
+                if not port_name or _VIRTUAL_INTERFACE_RE.search(port_name):
+                    continue
+
+                is_up = (item.get('status') or '').upper() == 'UP'
+                if_type = _sync_interface_type(port_name)
+
+                iface, created = Interface.objects.get_or_create(
+                    device=device,
+                    name=port_name,
+                    defaults={'type': if_type, 'enabled': is_up},
+                )
+                update_fields = []
+                if created:
+                    interfaces_created += 1
+                else:
+                    interfaces_updated += 1
+                    if iface.enabled != is_up:
+                        iface.enabled = is_up
+                        update_fields.append('enabled')
+
+                pvid = item.get('pvid')
+                if pvid is not None:
+                    try:
+                        pvid = int(pvid)
+                    except (TypeError, ValueError):
+                        pvid = None
+                vlan = vlans_by_vid.get(pvid) if pvid is not None else None
+                if vlan is not None:
+                    if iface.untagged_vlan_id != vlan.pk:
+                        iface.untagged_vlan = vlan
+                        update_fields.append('untagged_vlan')
+                    if iface.mode != 'access':
+                        iface.mode = 'access'
+                        update_fields.append('mode')
+
+                if update_fields:
+                    iface.save(update_fields=update_fields)
+
         messages.success(
             request,
-            _('Coleta enfileirada para {device} (Job #{id}).').format(
+            _(
+                'Sincronização concluída para {device}: '
+                '{iface_created} interface(s) criada(s), '
+                '{iface_updated} atualizada(s); '
+                '{vlan_created} VLAN(s) criada(s), '
+                '{vlan_existing} já existente(s).'
+            ).format(
                 device=device,
-                id=job.pk,
+                iface_created=interfaces_created,
+                iface_updated=interfaces_updated,
+                vlan_created=vlans_created,
+                vlan_existing=vlans_existing,
             ),
         )
-        return redirect(reverse('dcim:device_monitor', kwargs={'pk': device.pk}))
+        return redirect(redirect_url)
 
 
 class CollectAllView(View):

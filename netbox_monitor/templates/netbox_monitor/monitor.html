@@ -9,12 +9,20 @@
       <div class="text-muted">{% trans "Painel NOC" %} · v{{ plugin_version }}</div>
     </div>
     {% if request.user.is_authenticated %}
-      <form method="post" action="{% url 'plugins:netbox_monitor:collect_all' %}">
-        {% csrf_token %}
-        <button type="submit" class="btn btn-primary">
-          <i class="mdi mdi-play-circle"></i> {% trans "Coletar Todos Agora" %}
-        </button>
-      </form>
+      <div class="d-flex align-items-center gap-3 flex-wrap">
+        <form method="post" action="{% url 'plugins:netbox_monitor:collect_all' %}" class="mb-0">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-primary">
+            <i class="mdi mdi-play-circle"></i> {% trans "Coletar Todos Agora" %}
+          </button>
+        </form>
+        <div class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" role="switch" id="noc-auto-refresh" checked>
+          <label class="form-check-label small text-muted" for="noc-auto-refresh">
+            {% trans "Auto-atualizar (30s)" %}
+          </label>
+        </div>
+      </div>
     {% endif %}
   </div>
 
@@ -54,6 +62,10 @@
             <th>{% trans "Dispositivo" %}</th>
             <th>{% trans "IP primário" %}</th>
             <th>{% trans "Status" %}</th>
+            <th>{% trans "Uptime" %}</th>
+            <th>{% trans "Portas Ativas" %}</th>
+            <th>{% trans "Tráfego Total (Mbps)" %}</th>
+            <th>{% trans "STP / Loop" %}</th>
             <th>{% trans "Última latência" %}</th>
             <th>{% trans "Última coleta" %}</th>
           </tr>
@@ -65,9 +77,31 @@
               <td><code>{{ row.ip }}</code></td>
               <td>
                 {% if row.is_online %}
-                  <span class="badge bg-success">ONLINE</span>
+                  <span class="badge text-bg-success text-white">ONLINE</span>
                 {% else %}
-                  <span class="badge bg-danger">OFFLINE</span>
+                  <span class="badge text-bg-danger text-white">OFFLINE</span>
+                {% endif %}
+              </td>
+              <td>
+                {% if row.metric %}{{ row.uptime }}{% else %}—{% endif %}
+              </td>
+              <td>
+                {% if row.metric %}
+                  {{ row.active_ports }} / {{ row.total_ports }}
+                {% else %}—{% endif %}
+              </td>
+              <td>
+                {% if row.traffic_total is not None %}
+                  {{ row.traffic_total|floatformat:2 }}
+                {% else %}—{% endif %}
+              </td>
+              <td>
+                {% if row.stp_alert is None %}
+                  —
+                {% elif row.stp_alert %}
+                  <span class="badge text-bg-danger text-white">ALERTA LOOP</span>
+                {% else %}
+                  <span class="badge text-bg-success text-white">Normal</span>
                 {% endif %}
               </td>
               <td>
@@ -79,7 +113,7 @@
             </tr>
           {% empty %}
             <tr>
-              <td colspan="5" class="text-center text-muted py-4">
+              <td colspan="9" class="text-center text-muted py-4">
                 {% trans "Nenhum dispositivo com IP primário encontrado." %}
               </td>
             </tr>
@@ -88,5 +122,72 @@
       </table>
     </div>
   </div>
+
+  <div class="card mt-3">
+    <h5 class="card-header">{% trans "Incidentes e Eventos Recentes (24h)" %}</h5>
+    <div class="card-body">
+      {% if incidents %}
+        <ul class="list-group list-group-flush">
+          {% for event in incidents %}
+            <li class="list-group-item d-flex justify-content-between align-items-center gap-3 flex-wrap px-0">
+              <div class="d-flex align-items-center gap-3 flex-wrap">
+                <span class="text-muted small" style="min-width: 9rem;">
+                  <i class="mdi mdi-clock-outline"></i>
+                  {{ event.timestamp|date:"d/m/Y H:i:s" }}
+                </span>
+                <a href="{{ event.device.get_absolute_url }}">{{ event.device }}</a>
+                <span class="badge {{ event.badge_class }}">{{ event.event_type }}</span>
+              </div>
+              <span class="text-muted small text-end">{{ event.description }}</span>
+            </li>
+          {% endfor %}
+        </ul>
+      {% else %}
+        <div class="text-muted d-flex align-items-center gap-2">
+          <i class="mdi mdi-check-circle text-success fs-5"></i>
+          {% trans "Nenhum incidente registrado nas últimas 24 horas" %}
+        </div>
+      {% endif %}
+    </div>
+  </div>
 </div>
+<script>
+  (function () {
+    const STORAGE_KEY = 'netbox-monitor-auto-refresh';
+    const REFRESH_INTERVAL = 30000;
+    const toggle = document.getElementById('noc-auto-refresh');
+    if (!toggle) {
+      return;
+    }
+
+    let timer = null;
+
+    function schedule() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      if (!toggle.checked) {
+        return;
+      }
+      timer = setInterval(function () {
+        if (!document.hidden) {
+          window.location.reload();
+        }
+      }, REFRESH_INTERVAL);
+    }
+
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    if (stored !== null) {
+      toggle.checked = stored === '1';
+    }
+
+    toggle.addEventListener('change', function () {
+      window.localStorage.setItem(STORAGE_KEY, toggle.checked ? '1' : '0');
+      schedule();
+    });
+
+    schedule();
+  })();
+</script>
 {% endblock %}

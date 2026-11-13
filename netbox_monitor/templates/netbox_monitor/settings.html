@@ -1,0 +1,33 @@
+{% extends 'base/layout.html' %}
+{% load form_helpers %}
+{% load i18n %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="mb-3">
+    <h1 class="mb-0">{% trans "Configurações" %}</h1>
+    <div class="text-muted">
+      {% trans "Alertas e retenção de histórico do NetBox Monitor" %}
+    </div>
+  </div>
+
+  <div class="card">
+    <h5 class="card-header">{% trans "Alertas e Histórico" %}</h5>
+    <div class="card-body">
+      <form method="post" class="object-edit" data-disable-on-submit>
+        {% csrf_token %}
+        {% render_form form %}
+
+        <div class="btn-list mt-4">
+          <button type="submit" name="action" value="save" class="btn btn-primary">
+            <i class="mdi mdi-content-save"></i> {% trans "Salvar Configurações" %}
+          </button>
+          <button type="submit" name="action" value="test" class="btn btn-outline-primary">
+            <i class="mdi mdi-bell-ring"></i> {% trans "Testar Alerta Agora" %}
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endblock %}

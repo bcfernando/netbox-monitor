@@ -42,3 +42,62 @@ class DeviceMetric(models.Model):
         if minutes:
             return f'{minutes}m {seconds}s'
         return f'{seconds}s'
+
+
+class MonitorSettings(models.Model):
+    enabled = models.BooleanField(
+        default=True,
+        verbose_name='Alertas Ativos',
+    )
+    webhook_url = models.URLField(
+        max_length=500,
+        blank=True,
+        default='',
+        verbose_name='URL do Webhook (Telegram / Discord / Slack / n8n)',
+    )
+    telegram_chat_id = models.CharField(
+        max_length=100,
+        blank=True,
+        default='',
+        verbose_name='Telegram Chat ID (opcional)',
+    )
+    retention_days = models.PositiveIntegerField(
+        default=30,
+        verbose_name='Retenção do Histórico (dias)',
+    )
+
+    class Meta:
+        verbose_name = 'configuração do monitor'
+        verbose_name_plural = 'configurações do monitor'
+
+    def __str__(self):
+        return 'Configurações do NetBox Monitor'
+
+    def save(self, *args, **kwargs):
+        self.pk = 1
+        super().save(*args, **kwargs)
+
+    @classmethod
+    def get_solo(cls):
+        from netbox.plugins import get_plugin_config
+
+        try:
+            retention_days = int(
+                get_plugin_config('netbox_monitor', 'retention_days', 30)
+            )
+        except (TypeError, ValueError):
+            retention_days = 30
+
+        obj, _ = cls.objects.get_or_create(
+            pk=1,
+            defaults={
+                'webhook_url': get_plugin_config(
+                    'netbox_monitor', 'webhook_url', ''
+                ) or '',
+                'telegram_chat_id': get_plugin_config(
+                    'netbox_monitor', 'telegram_chat_id', ''
+                ) or '',
+                'retention_days': retention_days,
+            },
+        )
+        return obj

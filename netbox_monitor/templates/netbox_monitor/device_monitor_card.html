@@ -4,16 +4,16 @@
   <div class="card-body">
     {% if latest_metric %}
       {% if latest_metric.is_online %}
-        <span class="badge bg-success">ONLINE</span>
+        <span class="badge text-bg-success text-white">ONLINE</span>
       {% else %}
-        <span class="badge bg-danger">OFFLINE</span>
+        <span class="badge text-bg-danger text-white">OFFLINE</span>
       {% endif %}
       <div class="text-muted small mt-2">
         {% if has_latency %}{{ latest_metric.latency_ms }} ms · {% endif %}
         {{ latest_metric.timestamp }}
       </div>
     {% else %}
-      <span class="badge bg-secondary">SEM DADOS</span>
+      <span class="badge text-bg-secondary text-white">SEM DADOS</span>
     {% endif %}
     <div class="mt-3">
       <a class="btn btn-sm btn-outline-primary" href="{{ monitor_url }}">

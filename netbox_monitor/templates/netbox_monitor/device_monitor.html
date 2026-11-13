@@ -2,6 +2,16 @@
 {% load i18n %}
 
 {% block content %}
+<div class="d-flex justify-content-end align-items-center gap-2 mb-3">
+  <span class="text-muted small d-none d-sm-inline">{% trans "Período" %}:</span>
+  <div class="btn-group btn-group-sm" role="group" aria-label="{% trans 'Selecionar período' %}">
+    {% for option in range_options %}
+      <a href="?range={{ option.key }}"
+         class="btn {% if option.active %}btn-primary{% else %}btn-outline-secondary{% endif %}"
+         {% if option.active %}aria-current="true"{% endif %}>{{ option.label }}</a>
+    {% endfor %}
+  </div>
+</div>
 {% if loop_status %}
   {% if loop_status.has_alert %}
     <div class="alert alert-danger mb-3">
@@ -14,7 +24,7 @@
             <div class="mt-2">
               <span class="me-1">{% trans "Portas afetadas:" %}</span>
               {% for port in loop_status.blocked_ports %}
-                <span class="badge bg-danger me-1">{{ port }}</span>
+                <span class="badge text-bg-danger text-white me-1">{{ port }}</span>
               {% endfor %}
             </div>
           {% endif %}
@@ -23,7 +33,7 @@
     </div>
   {% else %}
     <div class="mb-3">
-      <span class="badge bg-success">
+      <span class="badge text-bg-success text-white">
         <i class="mdi mdi-check-circle"></i> {% trans "STP / Loop: Normal" %}
       </span>
       {% if loop_status.stp_changes is not None %}
@@ -233,7 +243,14 @@
     flex-direction: column;
     align-items: center;
     gap: 2px;
-    cursor: default;
+    cursor: pointer;
+    border-radius: 4px;
+    transition: background .15s ease, box-shadow .15s ease;
+  }
+  .nbx-faceplate .nbx-port-cell:hover,
+  .nbx-faceplate .nbx-port-cell.is-selected {
+    background: rgba(37, 99, 235, .18);
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, .55);
   }
   .nbx-faceplate .nbx-row-bottom .nbx-port-cell {
     flex-direction: column-reverse;
@@ -297,7 +314,15 @@
     flex-direction: column;
     align-items: center;
     gap: 3px;
-    cursor: default;
+    cursor: pointer;
+    padding: 2px;
+    border-radius: 5px;
+    transition: background .15s ease, box-shadow .15s ease;
+  }
+  .nbx-faceplate .nbx-sfp-cell:hover,
+  .nbx-faceplate .nbx-sfp-cell.is-selected {
+    background: rgba(37, 99, 235, .18);
+    box-shadow: 0 0 0 2px rgba(37, 99, 235, .55);
   }
   .nbx-faceplate .nbx-sfp {
     width: 34px;
@@ -433,7 +458,7 @@
               <div class="nbx-row nbx-row-top">
                 {% for pair in group.pairs %}
                   {% if pair.top %}
-                    <div class="nbx-port-cell {% if pair.top.is_up %}is-up{% else %}is-down{% endif %}" title="{{ pair.top.tooltip }}">
+                    <div class="nbx-port-cell {% if pair.top.is_up %}is-up{% else %}is-down{% endif %}" data-port="{{ pair.top.name }}" title="{{ pair.top.tooltip }}">
                       <span class="nbx-port-num">{{ pair.top.number }}</span>
                       <span class="nbx-port"></span>
                     </div>
@@ -445,7 +470,7 @@
               <div class="nbx-row nbx-row-bottom">
                 {% for pair in group.pairs %}
                   {% if pair.bottom %}
-                    <div class="nbx-port-cell {% if pair.bottom.is_up %}is-up{% else %}is-down{% endif %}" title="{{ pair.bottom.tooltip }}">
+                    <div class="nbx-port-cell {% if pair.bottom.is_up %}is-up{% else %}is-down{% endif %}" data-port="{{ pair.bottom.name }}" title="{{ pair.bottom.tooltip }}">
                       <span class="nbx-port-num">{{ pair.bottom.number }}</span>
                       <span class="nbx-port"></span>
                     </div>
@@ -462,7 +487,7 @@
             <div class="nbx-sfp-title">SFP / Uplink</div>
             <div class="nbx-sfp-list">
               {% for port in faceplate_sfp_ports %}
-                <div class="nbx-sfp-cell {% if port.is_up %}is-up{% else %}is-down{% endif %}" title="{{ port.tooltip }}">
+                <div class="nbx-sfp-cell {% if port.is_up %}is-up{% else %}is-down{% endif %}" data-port="{{ port.name }}" title="{{ port.tooltip }}">
                   <span class="nbx-sfp"></span>
                   <span class="nbx-port-num">{{ port.number }}</span>
                 </div>
@@ -483,9 +508,9 @@
       <div class="card-body">
         {% if latest_metric %}
           {% if latest_metric.is_online %}
-            <span class="badge bg-success fs-5">ONLINE</span>
+            <span class="badge text-bg-success text-white fs-5">ONLINE</span>
           {% else %}
-            <span class="badge bg-danger fs-5">OFFLINE</span>
+            <span class="badge text-bg-danger text-white fs-5">OFFLINE</span>
           {% endif %}
           <div class="mt-3">
             <div class="text-muted">{% trans "Última latência" %}</div>
@@ -497,23 +522,39 @@
             {% trans "Coletado em" %} {{ latest_metric.timestamp }}
           </div>
         {% else %}
-          <span class="badge bg-secondary fs-5">SEM DADOS</span>
+          <span class="badge text-bg-secondary text-white fs-5">SEM DADOS</span>
           <p class="text-muted mt-3 mb-0">{% trans "Nenhuma coleta realizada ainda." %}</p>
         {% endif %}
 
-        <form method="post" action="{% url 'plugins:netbox_monitor:device_collect' pk=object.pk %}" class="mt-3">
-          {% csrf_token %}
-          <button type="submit" class="btn btn-primary">
-            <i class="mdi mdi-access-point"></i> {% trans "Coletar Agora" %}
-          </button>
-        </form>
+        <div class="d-flex align-items-center gap-3 flex-wrap mt-3">
+          <form method="post" action="{% url 'plugins:netbox_monitor:device_collect' pk=object.pk %}">
+            {% csrf_token %}
+            <button type="submit" class="btn btn-primary">
+              <i class="mdi mdi-access-point"></i> {% trans "Coletar Agora" %}
+            </button>
+          </form>
+          {% if latest_metric and latest_metric.interfaces_summary %}
+            <form method="post" action="{% url 'plugins:netbox_monitor:device_sync' pk=object.pk %}">
+              {% csrf_token %}
+              <button type="submit" class="btn btn-outline-secondary">
+                <i class="mdi mdi-sync"></i> {% trans "Sincronizar no NetBox" %}
+              </button>
+            </form>
+          {% endif %}
+          <div class="form-check form-switch mb-0">
+            <input class="form-check-input" type="checkbox" role="switch" id="monitor-auto-refresh" checked>
+            <label class="form-check-label small text-muted" for="monitor-auto-refresh">
+              {% trans "Auto-atualizar (30s)" %}
+            </label>
+          </div>
+        </div>
       </div>
     </div>
   </div>
 
   <div class="col-md-4">
     <div class="card mb-3">
-      <h5 class="card-header">{% trans "Latência (últimas 24 coletas)" %}</h5>
+      <h5 class="card-header">{% trans "Latência" %} ({{ range_label }})</h5>
       <div class="card-body">
         <canvas id="latency-chart" height="120"></canvas>
       </div>
@@ -521,10 +562,43 @@
   </div>
 
   <div class="col-md-4">
-    <div class="card mb-3">
-      <h5 class="card-header">{% trans "CPU e Memória (%)" %}</h5>
-      <div class="card-body">
-        <canvas id="resource-chart" height="120"></canvas>
+    {% if has_resource_history %}
+      <div class="card mb-3">
+        <h5 class="card-header">{% trans "CPU e Memória" %} ({{ range_label }})</h5>
+        <div class="card-body">
+          <canvas id="resource-chart" height="120"></canvas>
+        </div>
+      </div>
+    {% elif show_traffic_chart %}
+      <div class="card mb-3">
+        <h5 class="card-header">{% trans "Tráfego Agregado" %} ({{ range_label }})</h5>
+        <div class="card-body">
+          <canvas id="traffic-chart" height="120"></canvas>
+        </div>
+      </div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row" id="port-history-row">
+  <div class="col-md-12">
+    <div class="card mb-3 d-none" id="port-history-card">
+      <h5 class="card-header d-flex justify-content-between align-items-center">
+        <span>
+          <i class="mdi mdi-chart-line"></i>
+          {% trans "Histórico de Tráfego da Porta" %}:
+          <span id="port-history-title" class="fw-semibold">—</span>
+        </span>
+        <button class="btn btn-sm btn-outline-secondary" type="button"
+                data-bs-toggle="collapse" data-bs-target="#port-history-body"
+                aria-expanded="true" aria-controls="port-history-body">
+          <i class="mdi mdi-chevron-up"></i>
+        </button>
+      </h5>
+      <div class="collapse show" id="port-history-body">
+        <div class="card-body">
+          <canvas id="port-history-chart" height="90"></canvas>
+        </div>
       </div>
     </div>
   </div>
@@ -548,26 +622,50 @@
           </div>
 
           <div class="row mt-3">
-            <div class="col-md-6">
-              <div class="card">
-                <div class="card-body py-2">
-                  <div class="text-muted small">{% trans "CPU" %}</div>
-                  <div class="fs-4">
-                    {% if latest_metric.cpu_percent is not None %}{{ latest_metric.cpu_percent }} %{% else %}—{% endif %}
+            {% if has_resource_data %}
+              <div class="col-md-6">
+                <div class="card">
+                  <div class="card-body py-2">
+                    <div class="text-muted small">{% trans "CPU" %}</div>
+                    <div class="fs-4">
+                      {% if latest_metric.cpu_percent is not None %}{{ latest_metric.cpu_percent }} %{% else %}—{% endif %}
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
-            <div class="col-md-6">
-              <div class="card">
-                <div class="card-body py-2">
-                  <div class="text-muted small">{% trans "Memória" %}</div>
-                  <div class="fs-4">
-                    {% if latest_metric.memory_percent is not None %}{{ latest_metric.memory_percent }} %{% else %}—{% endif %}
+              <div class="col-md-6">
+                <div class="card">
+                  <div class="card-body py-2">
+                    <div class="text-muted small">{% trans "Memória" %}</div>
+                    <div class="fs-4">
+                      {% if latest_metric.memory_percent is not None %}{{ latest_metric.memory_percent }} %{% else %}—{% endif %}
+                    </div>
                   </div>
                 </div>
               </div>
-            </div>
+            {% else %}
+              <div class="col-md-6">
+                <div class="card">
+                  <div class="card-body py-2">
+                    <div class="text-muted small">{% trans "Portas Ativas" %}</div>
+                    <div class="fs-4">
+                      {{ active_ports }} / {{ total_ports }}
+                      <span class="fs-6 text-muted">UP</span>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="card">
+                  <div class="card-body py-2">
+                    <div class="text-muted small">{% trans "Tráfego Total Atual" %}</div>
+                    <div class="fs-4">
+                      {% if total_traffic_mbps is not None %}{{ total_traffic_mbps|floatformat:2 }} Mbps{% else %}—{% endif %}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            {% endif %}
           </div>
 
           {% if interface_rows %}
@@ -584,29 +682,29 @@
               </thead>
               <tbody>
                 {% for interface in interface_rows %}
-                  <tr>
+                  <tr class="nbx-port-row" data-port="{{ interface.name }}" style="cursor: pointer;">
                     <td>
                       {{ interface.name }}
                       {% if interface.stp_state == 'BLOCKING' or interface.stp_state == 'BROKEN' %}
-                        <span class="badge bg-danger ms-1">LOOP / BLOCKING</span>
+                        <span class="badge text-bg-danger text-white ms-1">LOOP / BLOCKING</span>
                       {% endif %}
                     </td>
                     <td class="text-end">
                       {% if interface.status == 'UP' %}
-                        <span class="badge bg-success">UP</span>
+                        <span class="badge text-bg-success text-white">UP</span>
                       {% else %}
-                        <span class="badge bg-danger">DOWN</span>
+                        <span class="badge text-bg-danger text-white">DOWN</span>
                       {% endif %}
                     </td>
                     <td class="text-end">{% if interface.pvid is not None %}{{ interface.pvid }}{% else %}—{% endif %}</td>
                     <td class="text-end">
                       {% if interface.stp_state %}
                         {% if interface.stp_state == 'BLOCKING' or interface.stp_state == 'BROKEN' %}
-                          <span class="badge bg-danger">{{ interface.stp_state }}</span>
+                          <span class="badge text-bg-danger text-white">{{ interface.stp_state }}</span>
                         {% elif interface.stp_state == 'FORWARDING' %}
-                          <span class="badge bg-success">{{ interface.stp_state }}</span>
+                          <span class="badge text-bg-success text-white">{{ interface.stp_state }}</span>
                         {% else %}
-                          <span class="badge bg-secondary">{{ interface.stp_state }}</span>
+                          <span class="badge text-bg-secondary text-white">{{ interface.stp_state }}</span>
                         {% endif %}
                       {% else %}
                         —
@@ -643,7 +741,7 @@
                   </div>
                   <div class="mt-2">
                     {% for port in vlan.ports %}
-                      <span class="badge bg-secondary me-1 mb-1">{{ port }}</span>
+                      <span class="badge text-bg-secondary text-white me-1 mb-1">{{ port }}</span>
                     {% empty %}
                       <span class="text-muted small">{% trans "Sem portas associadas" %}</span>
                     {% endfor %}
@@ -664,6 +762,8 @@
 {{ chart_values|json_script:"chart-values" }}
 {{ cpu_chart_values|json_script:"cpu-chart-values" }}
 {{ memory_chart_values|json_script:"memory-chart-values" }}
+{{ traffic_chart_values|json_script:"traffic-chart-values" }}
+{{ port_history_json|json_script:"port-history-data" }}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
   (function () {
@@ -749,6 +849,185 @@
         }
       }
     });
+  })();
+
+  (function () {
+    const labels = JSON.parse(document.getElementById('chart-labels').textContent);
+    const trafficValues = JSON.parse(document.getElementById('traffic-chart-values').textContent);
+    const canvas = document.getElementById('traffic-chart');
+    if (!canvas || typeof Chart === 'undefined' || labels.length === 0) {
+      return;
+    }
+    new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Tráfego Agregado (Mbps)',
+          data: trafficValues,
+          borderColor: '#fd7e14',
+          backgroundColor: 'rgba(253, 126, 20, 0.15)',
+          fill: true,
+          tension: 0.3,
+          spanGaps: true
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { display: false }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            title: { display: true, text: 'Mbps' }
+          }
+        }
+      }
+    });
+  })();
+</script>
+<script>
+  (function () {
+    const dataEl = document.getElementById('port-history-data');
+    const card = document.getElementById('port-history-card');
+    const canvas = document.getElementById('port-history-chart');
+    const titleEl = document.getElementById('port-history-title');
+    if (!dataEl || !card || !canvas || typeof Chart === 'undefined') {
+      return;
+    }
+
+    let payload = { labels: [], ports: {} };
+    try {
+      payload = JSON.parse(dataEl.textContent);
+    } catch (error) {
+      return;
+    }
+    const labels = payload.labels || [];
+    const ports = payload.ports || {};
+    let chart = null;
+
+    function clearSelection() {
+      document.querySelectorAll('.is-selected').forEach(function (el) {
+        el.classList.remove('is-selected');
+      });
+    }
+
+    function showPort(name) {
+      const series = ports[name];
+      if (!series) {
+        return;
+      }
+      clearSelection();
+      document.querySelectorAll('[data-port]').forEach(function (el) {
+        if (el.getAttribute('data-port') === name) {
+          el.classList.add('is-selected');
+        }
+      });
+
+      titleEl.textContent = name + ' — Download / Upload (Mbps)';
+      card.classList.remove('d-none');
+      const body = document.getElementById('port-history-body');
+      if (body) {
+        body.classList.add('show');
+      }
+
+      const dataset = {
+        labels: labels,
+        datasets: [
+          {
+            label: 'Download (Mbps)',
+            data: series.download || [],
+            borderColor: '#0d6efd',
+            backgroundColor: 'rgba(13, 110, 253, 0.15)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2,
+            spanGaps: true
+          },
+          {
+            label: 'Upload (Mbps)',
+            data: series.upload || [],
+            borderColor: '#6f42c1',
+            backgroundColor: 'rgba(111, 66, 193, 0.12)',
+            fill: true,
+            tension: 0.3,
+            pointRadius: 2,
+            spanGaps: true
+          }
+        ]
+      };
+
+      if (chart) {
+        chart.data = dataset;
+        chart.update();
+      } else {
+        chart = new Chart(canvas, {
+          type: 'line',
+          data: dataset,
+          options: {
+            responsive: true,
+            interaction: { mode: 'index', intersect: false },
+            plugins: {
+              legend: { display: true, position: 'top' }
+            },
+            scales: {
+              y: {
+                beginAtZero: true,
+                title: { display: true, text: 'Mbps' }
+              }
+            }
+          }
+        });
+      }
+
+      card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+
+    document.querySelectorAll('[data-port]').forEach(function (el) {
+      el.addEventListener('click', function () {
+        showPort(el.getAttribute('data-port'));
+      });
+    });
+  })();
+</script>
+<script>
+  (function () {
+    const STORAGE_KEY = 'netbox-monitor-auto-refresh';
+    const REFRESH_INTERVAL = 30000;
+    const toggle = document.getElementById('monitor-auto-refresh');
+    if (!toggle) {
+      return;
+    }
+
+    let timer = null;
+
+    function schedule() {
+      if (timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+      if (!toggle.checked) {
+        return;
+      }
+      timer = setInterval(function () {
+        if (!document.hidden) {
+          window.location.reload();
+        }
+      }, REFRESH_INTERVAL);
+    }
+
+    const stored = window.localStorage.getItem(STORAGE_KEY);
+    if (stored !== null) {
+      toggle.checked = stored === '1';
+    }
+
+    toggle.addEventListener('change', function () {
+      window.localStorage.setItem(STORAGE_KEY, toggle.checked ? '1' : '0');
+      schedule();
+    });
+
+    schedule();
   })();
 </script>
 {% endblock %}

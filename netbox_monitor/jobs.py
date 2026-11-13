@@ -1,9 +1,17 @@
 import asyncio
+import json
+import logging
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import timedelta
 
 from dcim.models import Device
+from django.utils import timezone
 from netbox.jobs import JobRunner, system_job
 
-from .models import DeviceMetric
+from .models import DeviceMetric, MonitorSettings
+
+logger = logging.getLogger(__name__)
 
 OID_SYS_DESCR = '1.3.6.1.2.1.1.1.0'
 OID_SYS_UPTIME = '1.3.6.1.2.1.1.3.0'
@@ -33,8 +41,11 @@ STP_PORT_STATES = {
 STP_ALERT_STATES = ('BLOCKING', 'BROKEN')
 STP_RECENT_CHANGE_HUNDREDTHS = 30000
 
-SNMP_TIMEOUT = 4
-SNMP_RETRIES = 1
+SNMP_TIMEOUT = 2
+SNMP_RETRIES = 0
+SNMP_TOTAL_TIMEOUT = 8
+PING_TIMEOUT = 1
+COLLECT_MAX_WORKERS = 10
 SNMP_MAX_INTERFACES = 64
 SNMP_MAX_PROCESSORS = 256
 SNMP_MAX_STORAGE_ENTRIES = 2000
@@ -335,17 +346,162 @@ async def _collect_snmp_async(ip, community):
 
 
 def collect_snmp(ip, community='public'):
-    return asyncio.run(_collect_snmp_async(str(ip), community))
+    async def _run():
+        return await asyncio.wait_for(
+            _collect_snmp_async(str(ip), community),
+            timeout=SNMP_TOTAL_TIMEOUT,
+        )
+
+    return asyncio.run(_run())
 
 
-@system_job(interval=5)
+def collect_device(ip, community='public'):
+    """Coleta ping + SNMP de um dispositivo. Não acessa o banco de dados."""
+    import icmplib
+
+    data = {
+        'is_online': False,
+        'latency_ms': None,
+        'ping_error': None,
+        'snmp_error': None,
+    }
+
+    try:
+        host = icmplib.ping(str(ip), count=1, timeout=PING_TIMEOUT, privileged=False)
+        data['is_online'] = host.is_alive
+        if host.is_alive and host.avg_rtt is not None:
+            data['latency_ms'] = round(host.avg_rtt, 2)
+    except Exception as exc:
+        data['ping_error'] = str(exc)
+
+    if data['is_online']:
+        try:
+            snmp_data = collect_snmp(ip, community) or {}
+            data.update({
+                'sys_descr': snmp_data.get('sys_descr'),
+                'uptime_seconds': snmp_data.get('uptime_seconds'),
+                'cpu_percent': snmp_data.get('cpu_percent'),
+                'memory_percent': snmp_data.get('memory_percent'),
+                'interfaces_summary': snmp_data.get('interfaces_summary', []),
+                'vlans_summary': snmp_data.get('vlans_summary', []),
+                'loop_status': snmp_data.get('loop_status', {}),
+            })
+        except Exception as exc:
+            data['snmp_error'] = str(exc)
+
+    return data
+
+
+def send_webhook_alert(message):
+    settings_obj = MonitorSettings.get_solo()
+    if not settings_obj.enabled:
+        logger.info('Alertas desativados; webhook não enviado.')
+        return False
+
+    webhook_url = (settings_obj.webhook_url or '').strip()
+    if not webhook_url:
+        return False
+
+    if 'api.telegram.org' in webhook_url:
+        payload = {
+            'chat_id': settings_obj.telegram_chat_id,
+            'text': message,
+            'parse_mode': 'HTML',
+        }
+    else:
+        payload = {'content': message, 'text': message}
+
+    try:
+        request = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST',
+        )
+        with urllib.request.urlopen(request, timeout=3) as response:
+            response.read()
+    except Exception as exc:
+        logger.warning(f'Falha ao enviar alerta para o webhook: {exc}')
+        return False
+    return True
+
+
+def _device_ip(device):
+    if device.primary_ip is None:
+        return '-'
+    return str(device.primary_ip.address).split('/')[0]
+
+
+def check_metric_alerts(device, data):
+    previous = DeviceMetric.objects.filter(device=device).order_by('-timestamp').first()
+    if previous is None:
+        return
+
+    alerts = []
+    if previous.is_online and not data.get('is_online'):
+        alerts.append(
+            f'🔴 <b>OFFLINE</b>\n'
+            f'Dispositivo: {device.name}\n'
+            f'IP: {_device_ip(device)}'
+        )
+    elif not previous.is_online and data.get('is_online'):
+        alerts.append(
+            f'🟢 <b>ONLINE (Recuperado)</b>\n'
+            f'Dispositivo: {device.name}\n'
+            f'IP: {_device_ip(device)}'
+        )
+
+    was_loop_alert = bool((previous.loop_status or {}).get('has_alert'))
+    loop_status = data.get('loop_status') or {}
+    if not was_loop_alert and loop_status.get('has_alert'):
+        reason = loop_status.get('reason') or 'Motivo não informado.'
+        alerts.append(
+            f'⚠️ <b>LOOP DE REDE / STP DETECTADO</b>\n'
+            f'Dispositivo: {device.name}\n'
+            f'IP: {_device_ip(device)}\n'
+            f'Motivo: {reason}'
+        )
+
+    for message in alerts:
+        send_webhook_alert(message)
+
+
+def cleanup_old_metrics():
+    retention_days = MonitorSettings.get_solo().retention_days
+    try:
+        retention_days = int(retention_days)
+    except (TypeError, ValueError):
+        retention_days = 30
+
+    if retention_days <= 0:
+        return 0
+
+    cutoff = timezone.now() - timedelta(days=retention_days)
+    deleted, _ = DeviceMetric.objects.filter(timestamp__lt=cutoff).delete()
+    return deleted
+
+
+def save_metric(device, data):
+    return DeviceMetric.objects.create(
+        device=device,
+        is_online=data.get('is_online', False),
+        latency_ms=data.get('latency_ms'),
+        sys_descr=data.get('sys_descr'),
+        uptime_seconds=data.get('uptime_seconds'),
+        cpu_percent=data.get('cpu_percent'),
+        memory_percent=data.get('memory_percent'),
+        interfaces_summary=data.get('interfaces_summary', []),
+        vlans_summary=data.get('vlans_summary', []),
+        loop_status=data.get('loop_status', {}),
+    )
+
+
+@system_job(interval=1)
 class DeviceMonitorJob(JobRunner):
     class Meta:
         name = 'Device Monitoring'
 
     def run(self, *args, **kwargs):
-        import icmplib
-
         devices = Device.objects.filter(
             primary_ip4__isnull=False
         ) | Device.objects.filter(
@@ -358,37 +514,51 @@ class DeviceMonitorJob(JobRunner):
         else:
             devices = devices.distinct()
 
-        self.logger.info(f'Coletando métricas de {devices.count()} dispositivo(s)')
-
+        targets = []
         for device in devices:
             ip = str(device.primary_ip.address).split('/')[0]
-            try:
-                host = icmplib.ping(str(ip), count=1, timeout=2, privileged=False)
-                is_online = host.is_alive
-                latency_ms = round(host.avg_rtt, 2) if is_online and host.avg_rtt is not None else None
-            except Exception as exc:
-                self.logger.warning(f'Falha ao pingar {device} ({ip}): {exc}')
-                is_online = False
-                latency_ms = None
-
-            snmp_data = {}
             community = device.cf.get('snmp_community') or 'public'
-            try:
-                snmp_data = collect_snmp(ip, community) or {}
-            except Exception as exc:
-                self.logger.debug(f'Falha ao coletar SNMP de {device} ({ip}): {exc}')
+            targets.append((device, ip, community))
 
-            DeviceMetric.objects.create(
-                device=device,
-                is_online=is_online,
-                latency_ms=latency_ms,
-                sys_descr=snmp_data.get('sys_descr'),
-                uptime_seconds=snmp_data.get('uptime_seconds'),
-                cpu_percent=snmp_data.get('cpu_percent'),
-                memory_percent=snmp_data.get('memory_percent'),
-                interfaces_summary=snmp_data.get('interfaces_summary', []),
-                vlans_summary=snmp_data.get('vlans_summary', []),
-                loop_status=snmp_data.get('loop_status', {}),
+        self.logger.info(
+            f'Coletando métricas de {len(targets)} dispositivo(s) em paralelo '
+            f'(até {COLLECT_MAX_WORKERS} simultâneos)'
+        )
+
+        results = {}
+        if targets:
+            with ThreadPoolExecutor(max_workers=COLLECT_MAX_WORKERS) as executor:
+                futures = {
+                    executor.submit(collect_device, ip, community): device
+                    for device, ip, community in targets
+                }
+                for future in as_completed(futures):
+                    device = futures[future]
+                    try:
+                        results[device.pk] = future.result()
+                    except Exception as exc:
+                        self.logger.warning(f'Falha ao coletar {device}: {exc}')
+
+        for device, ip, community in targets:
+            data = results.get(device.pk)
+            if data is None:
+                continue
+            if data.get('ping_error'):
+                self.logger.warning(
+                    f'Falha ao pingar {device} ({ip}): {data["ping_error"]}'
+                )
+            if data.get('snmp_error'):
+                self.logger.debug(
+                    f'Falha ao coletar SNMP de {device} ({ip}): {data["snmp_error"]}'
+                )
+            check_metric_alerts(device, data)
+            save_metric(device, data)
+            status = 'ONLINE' if data.get('is_online') else 'OFFLINE'
+            latency_ms = data.get('latency_ms')
+            self.logger.info(
+                f'{device} ({ip}): {status} '
+                f'{latency_ms if latency_ms is not None else "-"} ms'
             )
-            status = 'ONLINE' if is_online else 'OFFLINE'
-            self.logger.info(f'{device} ({ip}): {status} {latency_ms if latency_ms is not None else "-"} ms')
+
+        deleted = cleanup_old_metrics()
+        self.logger.info(f'Limpeza de histórico: {deleted} registro(s) removido(s)')

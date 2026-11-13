@@ -7,6 +7,11 @@ class NetBoxMonitorConfig(PluginConfig):
     description = 'Monitoramento integrado estilo Zabbix/Grafana'
     version = '0.1.0'
     base_url = 'monitor'
+    default_settings = {
+        'webhook_url': '',
+        'telegram_chat_id': '',
+        'retention_days': 30,
+    }
 
     def ready(self):
         super().ready()
