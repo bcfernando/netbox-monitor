@@ -1,0 +1,44 @@
+from django.db import models
+
+from dcim.models import Device
+
+
+class DeviceMetric(models.Model):
+    device = models.ForeignKey(
+        to=Device,
+        on_delete=models.CASCADE,
+        related_name='metrics',
+    )
+    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+    is_online = models.BooleanField(default=False)
+    latency_ms = models.FloatField(null=True, blank=True)
+    sys_descr = models.CharField(max_length=255, null=True, blank=True)
+    uptime_seconds = models.BigIntegerField(null=True, blank=True)
+    cpu_percent = models.FloatField(null=True, blank=True)
+    memory_percent = models.FloatField(null=True, blank=True)
+    interfaces_summary = models.JSONField(default=list, blank=True)
+    vlans_summary = models.JSONField(default=list, blank=True)
+    loop_status = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ('-timestamp',)
+        verbose_name = 'métrica de dispositivo'
+        verbose_name_plural = 'métricas de dispositivo'
+
+    def __str__(self):
+        return f'{self.device} @ {self.timestamp:%Y-%m-%d %H:%M:%S}'
+
+    @property
+    def uptime_display(self):
+        if self.uptime_seconds is None:
+            return None
+        days, remainder = divmod(int(self.uptime_seconds), 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if days:
+            return f'{days}d {hours}h {minutes}m'
+        if hours:
+            return f'{hours}h {minutes}m'
+        if minutes:
+            return f'{minutes}m {seconds}s'
+        return f'{seconds}s'

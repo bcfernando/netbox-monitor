@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netbox-monitor"
+version = "0.1.0"
+description = "Monitoramento integrado estilo Zabbix/Grafana para NetBox"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Luiz" }]
+classifiers = [
+    "Framework :: Django",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+]
+dependencies = [
+    "icmplib>=3.0.4",
+    "pysnmp-lextudio>=6.0.0",
+]
+
+[tool.setuptools.packages.find]
+include = ["netbox_monitor*"]
+
+[tool.setuptools.package-data]
+netbox_monitor = ["templates/**/*.html", "static/**/*"]

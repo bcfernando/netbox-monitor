@@ -1,0 +1,754 @@
+{% extends 'dcim/device/base.html' %}
+{% load i18n %}
+
+{% block content %}
+{% if loop_status %}
+  {% if loop_status.has_alert %}
+    <div class="alert alert-danger mb-3">
+      <div class="d-flex align-items-start gap-2">
+        <i class="mdi mdi-alert-octagon fs-4"></i>
+        <div>
+          <h5 class="alert-heading mb-1">{% trans "Possível loop de rede detectado" %}</h5>
+          <div>{{ loop_status.reason }}</div>
+          {% if loop_status.blocked_ports %}
+            <div class="mt-2">
+              <span class="me-1">{% trans "Portas afetadas:" %}</span>
+              {% for port in loop_status.blocked_ports %}
+                <span class="badge bg-danger me-1">{{ port }}</span>
+              {% endfor %}
+            </div>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+  {% else %}
+    <div class="mb-3">
+      <span class="badge bg-success">
+        <i class="mdi mdi-check-circle"></i> {% trans "STP / Loop: Normal" %}
+      </span>
+      {% if loop_status.stp_changes is not None %}
+        <span class="text-muted small ms-2">{{ loop_status.stp_changes }} {% trans "mudança(s) de topologia desde o boot" %}</span>
+      {% endif %}
+    </div>
+  {% endif %}
+{% endif %}
+
+{% if faceplate_show %}
+<style>
+  .nbx-faceplate .nbx-chassis {
+    --nbx-bg: linear-gradient(145deg, #e5e7eb 0%, #cbd5e1 45%, #b8c0cc 100%);
+    --nbx-border: #94a3b8;
+    --nbx-text: #0f172a;
+    --nbx-brand: #334155;
+    --nbx-muted: #475569;
+    --nbx-band: #64748b;
+    --nbx-accent: #64748b;
+    --nbx-ear-bg: linear-gradient(180deg, #d7dde5 0%, #b8c0cc 100%);
+    --nbx-ear-border: #94a3b8;
+    --nbx-console: #2563eb;
+    --nbx-down: #374151;
+    position: relative;
+    margin: 0 16px 8px;
+    background: var(--nbx-bg);
+    border: 1px solid var(--nbx-border);
+    border-radius: 14px;
+    padding: 24px 22px 18px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .8), 0 10px 24px rgba(15, 23, 42, .18);
+    color: var(--nbx-text);
+    overflow: visible;
+  }
+  .nbx-faceplate .nbx-band {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 7px;
+    border-radius: 13px 13px 0 0;
+    background: var(--nbx-band);
+    box-shadow: inset 0 -1px 0 rgba(15, 23, 42, .18);
+  }
+  .nbx-faceplate .nbx-ear {
+    position: absolute;
+    top: 12px;
+    bottom: 12px;
+    width: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 0;
+    background: var(--nbx-ear-bg);
+    border: 1px solid var(--nbx-ear-border);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, .6), 0 2px 5px rgba(15, 23, 42, .25);
+  }
+  .nbx-faceplate .nbx-ear-left { left: -14px; border-radius: 7px 0 0 7px; }
+  .nbx-faceplate .nbx-ear-right { right: -14px; border-radius: 0 7px 7px 0; }
+  .nbx-faceplate .nbx-screw {
+    position: relative;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: radial-gradient(circle at 35% 30%, #f8fafc 0%, #94a3b8 55%, #475569 100%);
+    box-shadow: inset 0 0 0 1px rgba(15, 23, 42, .35);
+  }
+  .nbx-faceplate .nbx-screw::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 5px;
+    height: 1px;
+    background: rgba(15, 23, 42, .55);
+    transform: translate(-50%, -50%) rotate(45deg);
+  }
+  .nbx-faceplate .nbx-chassis-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    margin-bottom: 14px;
+  }
+  .nbx-faceplate .nbx-head-left {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    min-width: 0;
+  }
+  .nbx-faceplate .nbx-head-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+  }
+  .nbx-faceplate .nbx-system-leds {
+    display: flex;
+    gap: 9px;
+    padding: 5px 9px;
+    border-radius: 6px;
+    background: rgba(15, 23, 42, .06);
+    border: 1px solid rgba(15, 23, 42, .1);
+    box-shadow: inset 0 1px 2px rgba(15, 23, 42, .08);
+  }
+  .nbx-faceplate .nbx-led {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+  }
+  .nbx-faceplate .nbx-led-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: #22c55e;
+    box-shadow: 0 0 5px rgba(34, 197, 94, .9);
+  }
+  .nbx-faceplate .nbx-led-label {
+    font-size: .5rem;
+    line-height: 1;
+    letter-spacing: .06em;
+    color: var(--nbx-muted);
+  }
+  .nbx-faceplate .nbx-console {
+    position: relative;
+    width: 17px;
+    height: 15px;
+    border-radius: 3px;
+    background: var(--nbx-console);
+    border: 1px solid rgba(15, 23, 42, .35);
+    box-shadow: inset 0 -2px 0 rgba(0, 0, 0, .3), inset 0 1px 0 rgba(255, 255, 255, .25);
+  }
+  .nbx-faceplate .nbx-console::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 3px;
+    right: 3px;
+    height: 4px;
+    border-radius: 1px;
+    background: rgba(255, 255, 255, .35);
+  }
+  .nbx-faceplate .nbx-brand {
+    font-size: .68rem;
+    font-weight: 700;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--nbx-brand);
+  }
+  .nbx-faceplate .nbx-model {
+    font-size: .95rem;
+    font-weight: 600;
+    color: var(--nbx-text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .nbx-faceplate .nbx-legend {
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    font-size: .75rem;
+    color: var(--nbx-text);
+    white-space: nowrap;
+  }
+  .nbx-faceplate .nbx-legend span {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .nbx-faceplate .nbx-dot {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 3px;
+  }
+  .nbx-faceplate .nbx-dot.up { background: #10b981; }
+  .nbx-faceplate .nbx-dot.down { background: var(--nbx-down); }
+  .nbx-faceplate .nbx-ports-area {
+    display: flex;
+    align-items: center;
+    gap: 22px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+  }
+  .nbx-faceplate .nbx-groups {
+    display: flex;
+    gap: 18px;
+  }
+  .nbx-faceplate .nbx-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .nbx-faceplate .nbx-row {
+    display: flex;
+    gap: 6px;
+  }
+  .nbx-faceplate .nbx-slot {
+    display: inline-block;
+    width: 22px;
+    height: 18px;
+  }
+  .nbx-faceplate .nbx-port-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    cursor: default;
+  }
+  .nbx-faceplate .nbx-row-bottom .nbx-port-cell {
+    flex-direction: column-reverse;
+  }
+  .nbx-faceplate .nbx-port-num {
+    font-size: .6rem;
+    line-height: 1;
+    color: var(--nbx-muted);
+  }
+  .nbx-faceplate .nbx-port {
+    position: relative;
+    width: 22px;
+    height: 18px;
+    border-radius: 3px;
+    background: var(--nbx-down);
+    border: 1px solid rgba(15, 23, 42, .45);
+    box-shadow: inset 0 -2px 0 rgba(0, 0, 0, .25), inset 0 1px 0 rgba(255, 255, 255, .18);
+  }
+  .nbx-faceplate .nbx-port::after {
+    content: "";
+    position: absolute;
+    top: 3px;
+    left: 50%;
+    width: 10px;
+    height: 5px;
+    border-radius: 1px;
+    background: rgba(255, 255, 255, .35);
+    transform: translateX(-50%);
+  }
+  .nbx-faceplate .nbx-port-cell.is-up .nbx-port {
+    background: #10b981;
+    border-color: #047857;
+    box-shadow: inset 0 -2px 0 rgba(4, 120, 87, .55), 0 0 8px rgba(16, 185, 129, .55);
+  }
+  .nbx-faceplate .nbx-port-cell.is-up .nbx-port::after {
+    background: rgba(255, 255, 255, .65);
+  }
+  .nbx-faceplate .nbx-port-cell.is-down .nbx-port { background: var(--nbx-down); }
+  .nbx-faceplate .nbx-sfp-block {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-left: 18px;
+    border-left: 2px solid rgba(15, 23, 42, .2);
+  }
+  .nbx-faceplate .nbx-sfp-title {
+    font-size: .62rem;
+    letter-spacing: .12em;
+    text-align: center;
+    text-transform: uppercase;
+    color: var(--nbx-muted);
+  }
+  .nbx-faceplate .nbx-sfp-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    max-width: 220px;
+  }
+  .nbx-faceplate .nbx-sfp-cell {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 3px;
+    cursor: default;
+  }
+  .nbx-faceplate .nbx-sfp {
+    width: 34px;
+    height: 24px;
+    border-radius: 4px;
+    background: var(--nbx-down);
+    border: 1px solid rgba(15, 23, 42, .5);
+    box-shadow: inset 0 -2px 0 rgba(0, 0, 0, .3), inset 0 1px 0 rgba(255, 255, 255, .2);
+  }
+  .nbx-faceplate .nbx-sfp-cell.is-up .nbx-sfp {
+    background: #10b981;
+    border-color: #047857;
+    box-shadow: inset 0 -2px 0 rgba(4, 120, 87, .55), 0 0 8px rgba(16, 185, 129, .55);
+  }
+  .nbx-faceplate .nbx-sfp-cell.is-down .nbx-sfp { background: var(--nbx-down); }
+
+  .nbx-faceplate .nbx-theme-aruba {
+    --nbx-bg: linear-gradient(145deg, #ffffff 0%, #f8fafc 52%, #eef2f6 100%);
+    --nbx-border: #cbd5e1;
+    --nbx-text: #1f2937;
+    --nbx-brand: #ff8300;
+    --nbx-muted: #475569;
+    --nbx-band: #ff8300;
+    --nbx-accent: #ff8300;
+    --nbx-ear-bg: linear-gradient(180deg, #ffffff 0%, #e2e8f0 100%);
+    --nbx-ear-border: #cbd5e1;
+    --nbx-console: #94a3b8;
+    --nbx-down: #64748b;
+  }
+  .nbx-faceplate .nbx-theme-hpe {
+    --nbx-bg: linear-gradient(145deg, #f8fafc 0%, #e2e8f0 55%, #cbd5e1 100%);
+    --nbx-border: #94a3b8;
+    --nbx-text: #0f172a;
+    --nbx-brand: #01a982;
+    --nbx-muted: #475569;
+    --nbx-band: #01a982;
+    --nbx-accent: #01a982;
+    --nbx-ear-bg: linear-gradient(180deg, #e2e8f0 0%, #cbd5e1 100%);
+    --nbx-ear-border: #94a3b8;
+    --nbx-console: #64748b;
+    --nbx-down: #475569;
+  }
+  .nbx-faceplate .nbx-theme-cisco {
+    --nbx-bg: linear-gradient(145deg, #334155 0%, #1e293b 55%, #0f172a 100%);
+    --nbx-border: #0f172a;
+    --nbx-text: #e2e8f0;
+    --nbx-brand: #049fd9;
+    --nbx-muted: #94a3b8;
+    --nbx-band: #049fd9;
+    --nbx-accent: #049fd9;
+    --nbx-ear-bg: linear-gradient(180deg, #334155 0%, #1e293b 100%);
+    --nbx-ear-border: #0f172a;
+    --nbx-console: #049fd9;
+    --nbx-down: #475569;
+  }
+  .nbx-faceplate .nbx-theme-cisco .nbx-system-leds {
+    background: rgba(255, 255, 255, .07);
+    border-color: rgba(255, 255, 255, .14);
+  }
+  .nbx-faceplate .nbx-theme-mikrotik {
+    --nbx-bg: linear-gradient(145deg, #ffffff 0%, #f1f5f9 55%, #e2e8f0 100%);
+    --nbx-border: #cbd5e1;
+    --nbx-text: #0f172a;
+    --nbx-brand: #2563eb;
+    --nbx-muted: #475569;
+    --nbx-band: #2563eb;
+    --nbx-accent: #2563eb;
+    --nbx-ear-bg: linear-gradient(180deg, #f8fafc 0%, #dbe3ec 100%);
+    --nbx-ear-border: #cbd5e1;
+    --nbx-console: #64748b;
+    --nbx-down: #64748b;
+  }
+  .nbx-faceplate .nbx-theme-ubiquiti {
+    --nbx-bg: linear-gradient(145deg, #ffffff 0%, #f1f5f9 55%, #e2e8f0 100%);
+    --nbx-border: #cbd5e1;
+    --nbx-text: #0f172a;
+    --nbx-brand: #111827;
+    --nbx-muted: #475569;
+    --nbx-band: #111827;
+    --nbx-accent: #2563eb;
+    --nbx-ear-bg: linear-gradient(180deg, #f8fafc 0%, #dbe3ec 100%);
+    --nbx-ear-border: #cbd5e1;
+    --nbx-console: #64748b;
+    --nbx-down: #64748b;
+  }
+  .nbx-faceplate .nbx-theme-mikrotik .nbx-model,
+  .nbx-faceplate .nbx-theme-ubiquiti .nbx-model {
+    letter-spacing: .03em;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+</style>
+
+<div class="card mb-3 nbx-faceplate">
+  <h5 class="card-header">{% trans "Painel Frontal (Portas ao Vivo)" %}</h5>
+  <div class="card-body">
+    <div class="nbx-chassis nbx-theme-{{ vendor_theme|default:'default' }}">
+      <span class="nbx-band"></span>
+      <div class="nbx-ear nbx-ear-left" aria-hidden="true">
+        <span class="nbx-screw"></span>
+        <span class="nbx-screw"></span>
+        <span class="nbx-screw"></span>
+      </div>
+      <div class="nbx-ear nbx-ear-right" aria-hidden="true">
+        <span class="nbx-screw"></span>
+        <span class="nbx-screw"></span>
+        <span class="nbx-screw"></span>
+      </div>
+      <div class="nbx-chassis-head">
+        <div class="nbx-head-left">
+          <div class="nbx-system-leds" title="PWR / SYS / FAN">
+            <div class="nbx-led"><span class="nbx-led-dot"></span><span class="nbx-led-label">PWR</span></div>
+            <div class="nbx-led"><span class="nbx-led-dot"></span><span class="nbx-led-label">SYS</span></div>
+            <div class="nbx-led"><span class="nbx-led-dot"></span><span class="nbx-led-label">FAN</span></div>
+          </div>
+          {% if vendor_has_console %}
+            <div class="nbx-console" title="{% trans 'Console RJ45' %}"></div>
+          {% endif %}
+          <div class="nbx-head-text">
+            <div class="nbx-brand">{{ vendor_label|default:"Switch" }}</div>
+            <div class="nbx-model">{{ chassis_model }}</div>
+          </div>
+        </div>
+        <div class="nbx-legend">
+          <span><i class="nbx-dot up"></i>{% trans "UP" %}</span>
+          <span><i class="nbx-dot down"></i>{% trans "DOWN" %}</span>
+          <span>{{ faceplate_up }}/{{ faceplate_total }} {% trans "ativas" %}</span>
+        </div>
+      </div>
+      <div class="nbx-ports-area">
+        <div class="nbx-groups">
+          {% for group in faceplate_groups %}
+            <div class="nbx-group">
+              <div class="nbx-row nbx-row-top">
+                {% for pair in group.pairs %}
+                  {% if pair.top %}
+                    <div class="nbx-port-cell {% if pair.top.is_up %}is-up{% else %}is-down{% endif %}" title="{{ pair.top.tooltip }}">
+                      <span class="nbx-port-num">{{ pair.top.number }}</span>
+                      <span class="nbx-port"></span>
+                    </div>
+                  {% else %}
+                    <span class="nbx-slot"></span>
+                  {% endif %}
+                {% endfor %}
+              </div>
+              <div class="nbx-row nbx-row-bottom">
+                {% for pair in group.pairs %}
+                  {% if pair.bottom %}
+                    <div class="nbx-port-cell {% if pair.bottom.is_up %}is-up{% else %}is-down{% endif %}" title="{{ pair.bottom.tooltip }}">
+                      <span class="nbx-port-num">{{ pair.bottom.number }}</span>
+                      <span class="nbx-port"></span>
+                    </div>
+                  {% else %}
+                    <span class="nbx-slot"></span>
+                  {% endif %}
+                {% endfor %}
+              </div>
+            </div>
+          {% endfor %}
+        </div>
+        {% if faceplate_sfp_ports %}
+          <div class="nbx-sfp-block">
+            <div class="nbx-sfp-title">SFP / Uplink</div>
+            <div class="nbx-sfp-list">
+              {% for port in faceplate_sfp_ports %}
+                <div class="nbx-sfp-cell {% if port.is_up %}is-up{% else %}is-down{% endif %}" title="{{ port.tooltip }}">
+                  <span class="nbx-sfp"></span>
+                  <span class="nbx-port-num">{{ port.number }}</span>
+                </div>
+              {% endfor %}
+            </div>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+<div class="row">
+  <div class="col-md-4">
+    <div class="card mb-3">
+      <h5 class="card-header">{% trans "Status atual" %}</h5>
+      <div class="card-body">
+        {% if latest_metric %}
+          {% if latest_metric.is_online %}
+            <span class="badge bg-success fs-5">ONLINE</span>
+          {% else %}
+            <span class="badge bg-danger fs-5">OFFLINE</span>
+          {% endif %}
+          <div class="mt-3">
+            <div class="text-muted">{% trans "Última latência" %}</div>
+            <div class="fs-4">
+              {% if has_latency %}{{ latest_metric.latency_ms }} ms{% else %}—{% endif %}
+            </div>
+          </div>
+          <div class="text-muted small mt-2">
+            {% trans "Coletado em" %} {{ latest_metric.timestamp }}
+          </div>
+        {% else %}
+          <span class="badge bg-secondary fs-5">SEM DADOS</span>
+          <p class="text-muted mt-3 mb-0">{% trans "Nenhuma coleta realizada ainda." %}</p>
+        {% endif %}
+
+        <form method="post" action="{% url 'plugins:netbox_monitor:device_collect' pk=object.pk %}" class="mt-3">
+          {% csrf_token %}
+          <button type="submit" class="btn btn-primary">
+            <i class="mdi mdi-access-point"></i> {% trans "Coletar Agora" %}
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-md-4">
+    <div class="card mb-3">
+      <h5 class="card-header">{% trans "Latência (últimas 24 coletas)" %}</h5>
+      <div class="card-body">
+        <canvas id="latency-chart" height="120"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-md-4">
+    <div class="card mb-3">
+      <h5 class="card-header">{% trans "CPU e Memória (%)" %}</h5>
+      <div class="card-body">
+        <canvas id="resource-chart" height="120"></canvas>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col-md-12">
+    <div class="card mb-3">
+      <h5 class="card-header">{% trans "Informações SNMP" %}</h5>
+      <div class="card-body">
+        {% if latest_metric.sys_descr or latest_metric.uptime_seconds is not None or latest_metric.interfaces_summary or latest_metric.cpu_percent is not None or latest_metric.memory_percent is not None %}
+          <div class="row">
+            <div class="col-md-8">
+              <div class="text-muted small">sysDescr</div>
+              <div>{{ latest_metric.sys_descr|default:"—" }}</div>
+            </div>
+            <div class="col-md-4">
+              <div class="text-muted small">{% trans "Uptime" %}</div>
+              <div class="fs-5">{{ latest_metric.uptime_display|default:"—" }}</div>
+            </div>
+          </div>
+
+          <div class="row mt-3">
+            <div class="col-md-6">
+              <div class="card">
+                <div class="card-body py-2">
+                  <div class="text-muted small">{% trans "CPU" %}</div>
+                  <div class="fs-4">
+                    {% if latest_metric.cpu_percent is not None %}{{ latest_metric.cpu_percent }} %{% else %}—{% endif %}
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div class="col-md-6">
+              <div class="card">
+                <div class="card-body py-2">
+                  <div class="text-muted small">{% trans "Memória" %}</div>
+                  <div class="fs-4">
+                    {% if latest_metric.memory_percent is not None %}{{ latest_metric.memory_percent }} %{% else %}—{% endif %}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {% if interface_rows %}
+            <table class="table table-sm table-hover mt-3 mb-0">
+              <thead>
+                <tr>
+                  <th>{% trans "Interface" %}</th>
+                  <th class="text-end">{% trans "Status" %}</th>
+                  <th class="text-end">{% trans "VLAN (PVID)" %}</th>
+                  <th class="text-end">{% trans "STP" %}</th>
+                  <th class="text-end">{% trans "Download (Mbps)" %}</th>
+                  <th class="text-end">{% trans "Upload (Mbps)" %}</th>
+                </tr>
+              </thead>
+              <tbody>
+                {% for interface in interface_rows %}
+                  <tr>
+                    <td>
+                      {{ interface.name }}
+                      {% if interface.stp_state == 'BLOCKING' or interface.stp_state == 'BROKEN' %}
+                        <span class="badge bg-danger ms-1">LOOP / BLOCKING</span>
+                      {% endif %}
+                    </td>
+                    <td class="text-end">
+                      {% if interface.status == 'UP' %}
+                        <span class="badge bg-success">UP</span>
+                      {% else %}
+                        <span class="badge bg-danger">DOWN</span>
+                      {% endif %}
+                    </td>
+                    <td class="text-end">{% if interface.pvid is not None %}{{ interface.pvid }}{% else %}—{% endif %}</td>
+                    <td class="text-end">
+                      {% if interface.stp_state %}
+                        {% if interface.stp_state == 'BLOCKING' or interface.stp_state == 'BROKEN' %}
+                          <span class="badge bg-danger">{{ interface.stp_state }}</span>
+                        {% elif interface.stp_state == 'FORWARDING' %}
+                          <span class="badge bg-success">{{ interface.stp_state }}</span>
+                        {% else %}
+                          <span class="badge bg-secondary">{{ interface.stp_state }}</span>
+                        {% endif %}
+                      {% else %}
+                        —
+                      {% endif %}
+                    </td>
+                    <td class="text-end">{% if interface.download_mbps is not None %}{{ interface.download_mbps|floatformat:2 }}{% else %}—{% endif %}</td>
+                    <td class="text-end">{% if interface.upload_mbps is not None %}{{ interface.upload_mbps|floatformat:2 }}{% else %}—{% endif %}</td>
+                  </tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          {% endif %}
+        {% else %}
+          <p class="text-muted mb-0">{% trans "Nenhuma coleta SNMP disponível." %}</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="row">
+  <div class="col-md-12">
+    <div class="card mb-3">
+      <h5 class="card-header">{% trans "VLANs Configuradas no Switch" %}</h5>
+      <div class="card-body">
+        {% if vlans_summary %}
+          <div class="row">
+            {% for vlan in vlans_summary %}
+              <div class="col-md-6 col-xl-4 mb-3">
+                <div class="border rounded p-2 h-100">
+                  <div class="d-flex justify-content-between align-items-baseline">
+                    <strong>VLAN {{ vlan.vlan_id }}</strong>
+                    <span class="text-muted small text-truncate ms-2">{{ vlan.name|default:"—" }}</span>
+                  </div>
+                  <div class="mt-2">
+                    {% for port in vlan.ports %}
+                      <span class="badge bg-secondary me-1 mb-1">{{ port }}</span>
+                    {% empty %}
+                      <span class="text-muted small">{% trans "Sem portas associadas" %}</span>
+                    {% endfor %}
+                  </div>
+                </div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="text-muted mb-0">{% trans "Nenhuma VLAN coletada via SNMP (OID indisponível ou não configurado)." %}</p>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{{ chart_labels|json_script:"chart-labels" }}
+{{ chart_values|json_script:"chart-values" }}
+{{ cpu_chart_values|json_script:"cpu-chart-values" }}
+{{ memory_chart_values|json_script:"memory-chart-values" }}
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+  (function () {
+    const labels = JSON.parse(document.getElementById('chart-labels').textContent);
+    const values = JSON.parse(document.getElementById('chart-values').textContent);
+    const canvas = document.getElementById('latency-chart');
+    if (!canvas || typeof Chart === 'undefined' || labels.length === 0) {
+      return;
+    }
+    new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [{
+          label: 'Latência (ms)',
+          data: values,
+          borderColor: '#0d6efd',
+          backgroundColor: 'rgba(13, 110, 253, 0.15)',
+          fill: true,
+          tension: 0.3,
+          spanGaps: true
+        }]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { display: false }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            title: { display: true, text: 'ms' }
+          }
+        }
+      }
+    });
+  })();
+
+  (function () {
+    const labels = JSON.parse(document.getElementById('chart-labels').textContent);
+    const cpuValues = JSON.parse(document.getElementById('cpu-chart-values').textContent);
+    const memoryValues = JSON.parse(document.getElementById('memory-chart-values').textContent);
+    const canvas = document.getElementById('resource-chart');
+    if (!canvas || typeof Chart === 'undefined' || labels.length === 0) {
+      return;
+    }
+    new Chart(canvas, {
+      type: 'line',
+      data: {
+        labels: labels,
+        datasets: [
+          {
+            label: 'CPU (%)',
+            data: cpuValues,
+            borderColor: '#dc3545',
+            backgroundColor: 'rgba(220, 53, 69, 0.15)',
+            fill: true,
+            tension: 0.3,
+            spanGaps: true
+          },
+          {
+            label: 'Memória (%)',
+            data: memoryValues,
+            borderColor: '#198754',
+            backgroundColor: 'rgba(25, 135, 84, 0.15)',
+            fill: true,
+            tension: 0.3,
+            spanGaps: true
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { display: true }
+        },
+        scales: {
+          y: {
+            beginAtZero: true,
+            max: 100,
+            title: { display: true, text: '%' }
+          }
+        }
+      }
+    });
+  })();
+</script>
+{% endblock %}
