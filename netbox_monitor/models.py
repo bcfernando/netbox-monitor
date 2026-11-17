@@ -19,6 +19,7 @@ class DeviceMetric(models.Model):
     interfaces_summary = models.JSONField(default=list, blank=True)
     vlans_summary = models.JSONField(default=list, blank=True)
     loop_status = models.JSONField(default=dict, blank=True)
+    hardware_metrics = models.JSONField(default=dict, blank=True)
 
     class Meta:
         ordering = ('-timestamp',)

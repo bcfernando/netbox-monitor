@@ -21,9 +21,29 @@ OID_IF_IN_OCTETS = '1.3.6.1.2.1.2.2.1.10'
 OID_IF_OUT_OCTETS = '1.3.6.1.2.1.2.2.1.16'
 OID_IF_HC_IN_OCTETS = '1.3.6.1.2.1.31.1.1.1.6'
 OID_IF_HC_OUT_OCTETS = '1.3.6.1.2.1.31.1.1.1.10'
+OID_IF_HIGH_SPEED = '1.3.6.1.2.1.31.1.1.1.15'
+OID_IF_SPEED = '1.3.6.1.2.1.2.2.1.5'
 OID_HR_PROCESSOR_LOAD = '1.3.6.1.2.1.25.3.3.1.2'
+OID_CISCO_CPU_LOAD = '1.3.6.1.4.1.9.9.109.1.1.1.1.7'
+OID_HPE_CPU_LOAD_1 = '1.3.6.1.4.1.11.2.14.11.5.1.9.6.1.0'
+OID_HPE_CPU_LOAD_2 = '1.3.6.1.4.1.25506.2.6.1.1.1.1.6'
+OID_MIKROTIK_CPU_LOAD = '1.3.6.1.4.1.14988.1.1.3.10.0'
 OID_HR_STORAGE_TABLE = '1.3.6.1.2.1.25.2.3.1'
 OID_HR_STORAGE_TYPE_RAM = '1.3.6.1.2.1.25.2.1.2'
+OID_ENT_PHY_SENSOR_TYPE = '1.3.6.1.2.1.99.1.1.1.1'
+OID_ENT_PHY_SENSOR_SCALE = '1.3.6.1.2.1.99.1.1.1.2'
+OID_ENT_PHY_SENSOR_PRECISION = '1.3.6.1.2.1.99.1.1.1.3'
+OID_ENT_PHY_SENSOR_VALUE = '1.3.6.1.2.1.99.1.1.1.4'
+OID_ENT_PHY_SENSOR_OPER_STATUS = '1.3.6.1.2.1.99.1.1.1.5'
+OID_ENT_PHYSICAL_NAME = '1.3.6.1.2.1.47.1.1.1.1.7'
+OID_MIKROTIK_TEMPERATURE = '1.3.6.1.4.1.14988.1.1.3.10.0'
+OID_MIKROTIK_FAN_SPEED = '1.3.6.1.4.1.14988.1.1.3.11.0'
+OID_CISCO_ENVMON_TEMPERATURE = '1.3.6.1.4.1.9.9.13.1.3'
+OID_CISCO_ENVMON_FAN = '1.3.6.1.4.1.9.9.13.1.4'
+OID_CISCO_ENVMON_TEMP_NAME = f'{OID_CISCO_ENVMON_TEMPERATURE}.1.1'
+OID_CISCO_ENVMON_TEMP_VALUE = f'{OID_CISCO_ENVMON_TEMPERATURE}.1.2'
+OID_CISCO_ENVMON_FAN_NAME = f'{OID_CISCO_ENVMON_FAN}.1.1'
+OID_CISCO_ENVMON_FAN_STATE = f'{OID_CISCO_ENVMON_FAN}.1.2'
 OID_DOT1Q_VLAN_STATIC_NAME = '1.3.6.1.2.1.17.7.1.4.3.1.1'
 OID_DOT1Q_PVID = '1.3.6.1.2.1.17.7.1.4.5.1.1'
 OID_DOT1D_STP_TOP_CHANGES = '1.3.6.1.2.1.17.2.4.0'
@@ -51,6 +71,24 @@ SNMP_MAX_PROCESSORS = 256
 SNMP_MAX_STORAGE_ENTRIES = 2000
 SNMP_MAX_VLANS = 512
 SNMP_MAX_STP_PORTS = 512
+SNMP_MAX_SENSORS = 512
+HARDWARE_COLLECTION_TIMEOUT = 4
+
+ENTITY_SENSOR_TYPE_CELSIUS = 8
+ENTITY_SENSOR_TYPE_RPM = 10
+ENTITY_SENSOR_OPER_STATUS = {
+    1: 'OK',
+    2: 'INDISPONÍVEL',
+    3: 'FALHA',
+}
+CISCO_ENVMON_FAN_STATES = {
+    1: 'OK',
+    2: 'ALERTA',
+    3: 'CRÍTICO',
+    4: 'DESLIGADO',
+    5: 'AUSENTE',
+    6: 'FALHA',
+}
 
 
 def _to_int(value):
@@ -209,6 +247,188 @@ async def _collect_loop_status(engine, auth, target, context, index_to_name):
     }, port_states
 
 
+def _entity_sensor_value(raw, scale, precision):
+    try:
+        raw = int(raw)
+        scale = int(scale)
+        precision = int(precision)
+    except (TypeError, ValueError):
+        return None
+    return raw * (10.0 ** (scale - 9 - precision))
+
+
+async def _collect_entity_sensors(engine, auth, target, context):
+    names = {}
+    try:
+        name_values = await _snmp_walk(
+            engine, auth, target, context, OID_ENT_PHYSICAL_NAME, SNMP_MAX_SENSORS
+        )
+        names = {
+            _oid_index(oid): str(value)[:64] for oid, value in name_values.items()
+        }
+    except Exception:
+        names = {}
+
+    sensors = {}
+    for column, oid in (
+        ('type', OID_ENT_PHY_SENSOR_TYPE),
+        ('scale', OID_ENT_PHY_SENSOR_SCALE),
+        ('precision', OID_ENT_PHY_SENSOR_PRECISION),
+        ('value', OID_ENT_PHY_SENSOR_VALUE),
+        ('oper_status', OID_ENT_PHY_SENSOR_OPER_STATUS),
+    ):
+        try:
+            values = await _snmp_walk(
+                engine, auth, target, context, oid, SNMP_MAX_SENSORS
+            )
+        except Exception:
+            values = {}
+        for oid_key, value in values.items():
+            sensors.setdefault(_oid_index(oid_key), {})[column] = value
+
+    temperatures = []
+    fans = []
+    for index in sorted(sensors):
+        entry = sensors[index]
+        sensor_type = _to_int(entry.get('type'))
+        raw = _to_int(entry.get('value'))
+        if raw is None or sensor_type not in (
+            ENTITY_SENSOR_TYPE_CELSIUS,
+            ENTITY_SENSOR_TYPE_RPM,
+        ):
+            continue
+
+        scale = _to_int(entry.get('scale'))
+        precision = _to_int(entry.get('precision'))
+        if scale is None:
+            scale = 9
+        if precision is None:
+            precision = 0
+
+        value = _entity_sensor_value(raw, scale, precision)
+        if value is None:
+            continue
+
+        name = names.get(index) or f'Sensor {index}'
+        status = ENTITY_SENSOR_OPER_STATUS.get(
+            _to_int(entry.get('oper_status')), 'DESCONHECIDO'
+        )
+
+        if sensor_type == ENTITY_SENSOR_TYPE_CELSIUS:
+            temperatures.append({'name': name, 'value_c': round(value, 1)})
+        elif sensor_type == ENTITY_SENSOR_TYPE_RPM:
+            fans.append({
+                'name': name,
+                'rpm': int(round(value)),
+                'status': status,
+            })
+
+    return temperatures, fans
+
+
+async def _collect_cisco_envmon(engine, auth, target, context):
+    temperatures = []
+    fans = []
+
+    try:
+        temp_names = await _snmp_walk(
+            engine, auth, target, context, OID_CISCO_ENVMON_TEMP_NAME, SNMP_MAX_SENSORS
+        )
+        temp_values = await _snmp_walk(
+            engine, auth, target, context, OID_CISCO_ENVMON_TEMP_VALUE, SNMP_MAX_SENSORS
+        )
+        names = {
+            _oid_index(oid): str(value)[:64] for oid, value in temp_names.items()
+        }
+        for oid, value in temp_values.items():
+            index = _oid_index(oid)
+            temperature = _to_int(value)
+            if temperature is None:
+                continue
+            temperatures.append({
+                'name': names.get(index) or f'Sensor {index}',
+                'value_c': temperature,
+            })
+    except Exception:
+        temperatures = []
+
+    try:
+        fan_names = await _snmp_walk(
+            engine, auth, target, context, OID_CISCO_ENVMON_FAN_NAME, SNMP_MAX_SENSORS
+        )
+        fan_states = await _snmp_walk(
+            engine, auth, target, context, OID_CISCO_ENVMON_FAN_STATE, SNMP_MAX_SENSORS
+        )
+        names = {
+            _oid_index(oid): str(value)[:64] for oid, value in fan_names.items()
+        }
+        for oid, value in fan_states.items():
+            index = _oid_index(oid)
+            state = _to_int(value)
+            fans.append({
+                'name': names.get(index) or f'Ventoinha {index}',
+                'rpm': None,
+                'status': CISCO_ENVMON_FAN_STATES.get(state, str(state)),
+            })
+    except Exception:
+        fans = []
+
+    return temperatures, fans
+
+
+async def _collect_mikrotik_hardware(engine, auth, target, context):
+    temperature = None
+    fan = None
+
+    try:
+        value = await _snmp_get(
+            engine, auth, target, context, OID_MIKROTIK_TEMPERATURE
+        )
+        raw = _to_int(value)
+        if raw is not None:
+            temperature = {'name': 'Temperatura', 'value_c': raw}
+    except Exception:
+        temperature = None
+
+    try:
+        value = await _snmp_get(
+            engine, auth, target, context, OID_MIKROTIK_FAN_SPEED
+        )
+        raw = _to_int(value)
+        if raw is not None:
+            fan = {'name': 'Ventoinha', 'rpm': raw, 'status': 'OK'}
+    except Exception:
+        fan = None
+
+    return temperature, fan
+
+
+async def _collect_hardware_metrics(engine, auth, target, context):
+    temperatures, fans = await _collect_entity_sensors(
+        engine, auth, target, context
+    )
+
+    if not temperatures or not fans:
+        cisco_temperatures, cisco_fans = await _collect_cisco_envmon(
+            engine, auth, target, context
+        )
+        if not temperatures:
+            temperatures = cisco_temperatures
+        if not fans:
+            fans = cisco_fans
+
+    if not temperatures or not fans:
+        mikrotik_temperature, mikrotik_fan = await _collect_mikrotik_hardware(
+            engine, auth, target, context
+        )
+        if not temperatures and mikrotik_temperature is not None:
+            temperatures = [mikrotik_temperature]
+        if not fans and mikrotik_fan is not None:
+            fans = [mikrotik_fan]
+
+    return {'temperatures': temperatures, 'fans': fans}
+
+
 async def _collect_snmp_async(ip, community):
     from pysnmp.hlapi.asyncio import (
         CommunityData,
@@ -262,6 +482,35 @@ async def _collect_snmp_async(ip, community):
     except Exception:
         cpu_percent = None
 
+    if cpu_percent is None:
+        try:
+            cisco_values = await _snmp_walk(
+                engine, auth, target, context, OID_CISCO_CPU_LOAD, SNMP_MAX_PROCESSORS
+            )
+            loads = [
+                load for load in (_to_int(v) for v in cisco_values.values())
+                if load is not None
+            ]
+            if loads:
+                cpu_percent = round(sum(loads) / len(loads), 1)
+        except Exception:
+            cpu_percent = None
+
+    if cpu_percent is None:
+        for oid in (
+            OID_HPE_CPU_LOAD_1,
+            OID_HPE_CPU_LOAD_2,
+            OID_MIKROTIK_CPU_LOAD,
+        ):
+            try:
+                value = await _snmp_get(engine, auth, target, context, oid)
+                load = _to_int(value)
+                if load is not None:
+                    cpu_percent = float(load)
+                    break
+            except Exception:
+                continue
+
     memory_percent = None
     try:
         storage_values = await _snmp_walk(
@@ -309,6 +558,16 @@ async def _collect_snmp_async(ip, community):
             engine, auth, target, context, out_oid, SNMP_MAX_INTERFACES
         )
 
+    speed_oid = OID_IF_HIGH_SPEED
+    speed_values = await _snmp_walk(
+        engine, auth, target, context, speed_oid, SNMP_MAX_INTERFACES
+    )
+    if not speed_values:
+        speed_oid = OID_IF_SPEED
+        speed_values = await _snmp_walk(
+            engine, auth, target, context, speed_oid, SNMP_MAX_INTERFACES
+        )
+
     descr_items = list(descr_values.items())[:SNMP_MAX_INTERFACES]
     index_to_name = {
         _oid_index(oid): str(name)[:64] for oid, name in descr_items
@@ -325,14 +584,31 @@ async def _collect_snmp_async(ip, community):
     for oid, name in descr_items:
         index = _oid_index(oid)
         status = status_values.get(f'{OID_IF_OPER_STATUS}.{index}')
+        speed_mbps = None
+        speed_raw = _to_int(speed_values.get(f'{speed_oid}.{index}'))
+        if speed_raw is not None and speed_raw > 0:
+            if speed_oid == OID_IF_HIGH_SPEED:
+                speed_mbps = speed_raw
+            else:
+                speed_mbps = round(speed_raw / 1_000_000)
         interfaces.append({
             'name': str(name)[:64],
             'status': 'UP' if status is not None and _to_int(status) == 1 else 'DOWN',
+            'speed_mbps': speed_mbps,
             'in_octets': _to_int(in_values.get(f'{in_oid}.{index}')),
             'out_octets': _to_int(out_values.get(f'{out_oid}.{index}')),
             'pvid': pvid_by_index.get(index),
             'stp_state': stp_states.get(index),
         })
+
+    hardware_metrics = {'temperatures': [], 'fans': []}
+    try:
+        hardware_metrics = await asyncio.wait_for(
+            _collect_hardware_metrics(engine, auth, target, context),
+            timeout=HARDWARE_COLLECTION_TIMEOUT,
+        )
+    except Exception:
+        hardware_metrics = {'temperatures': [], 'fans': []}
 
     return {
         'sys_descr': sys_descr[:255] if sys_descr else None,
@@ -342,6 +618,7 @@ async def _collect_snmp_async(ip, community):
         'interfaces_summary': interfaces,
         'vlans_summary': vlans_summary,
         'loop_status': loop_status,
+        'hardware_metrics': hardware_metrics,
     }
 
 
@@ -385,6 +662,7 @@ def collect_device(ip, community='public'):
                 'interfaces_summary': snmp_data.get('interfaces_summary', []),
                 'vlans_summary': snmp_data.get('vlans_summary', []),
                 'loop_status': snmp_data.get('loop_status', {}),
+                'hardware_metrics': snmp_data.get('hardware_metrics', {}),
             })
         except Exception as exc:
             data['snmp_error'] = str(exc)
@@ -493,6 +771,7 @@ def save_metric(device, data):
         interfaces_summary=data.get('interfaces_summary', []),
         vlans_summary=data.get('vlans_summary', []),
         loop_status=data.get('loop_status', {}),
+        hardware_metrics=data.get('hardware_metrics', {}),
     )
 
 

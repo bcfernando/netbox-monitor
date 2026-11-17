@@ -442,7 +442,7 @@
           {% endif %}
           <div class="nbx-head-text">
             <div class="nbx-brand">{{ vendor_label|default:"Switch" }}</div>
-            <div class="nbx-model">{{ chassis_model }}</div>
+            <div class="nbx-model">{{ chassis_model|upper }}</div>
           </div>
         </div>
         <div class="nbx-legend">
@@ -580,6 +580,54 @@
   </div>
 </div>
 
+{% if has_hardware_sensors %}
+<div class="row">
+  {% if has_temperatures %}
+    <div class="col-md-4">
+      <div class="card mb-3">
+        <h5 class="card-header"><i class="mdi mdi-thermometer"></i> {% trans "Temperatura" %}</h5>
+        <div class="card-body">
+          <div class="text-muted small">{% trans "Maior temperatura" %}</div>
+          <div class="fs-3 fw-semibold">
+            {% if max_temperature is not None %}{{ max_temperature }} °C{% else %}—{% endif %}
+          </div>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+
+  <div class="{% if has_temperatures %}col-md-8{% else %}col-md-12{% endif %}">
+    <div class="card mb-3">
+      <h5 class="card-header">
+        <i class="mdi mdi-fan"></i> {% trans "Sensores de Hardware (Temperatura & Ventoinhas)" %}
+      </h5>
+      <div class="card-body">
+        {% if has_temperatures %}
+          <div class="text-muted small mb-2">{% trans "Temperatura" %}</div>
+          <div class="d-flex flex-wrap gap-2 mb-3">
+            {% for sensor in temperatures %}
+              <span class="badge text-white {{ sensor.badge_class }}">
+                {{ sensor.name }}: {{ sensor.value_c }} °C
+              </span>
+            {% endfor %}
+          </div>
+        {% endif %}
+        {% if has_fans %}
+          <div class="text-muted small mb-2">{% trans "Ventoinhas" %}</div>
+          <div class="d-flex flex-wrap gap-2">
+            {% for fan in fans %}
+              <span class="badge text-white {{ fan.badge_class }}">
+                {{ fan.name }}{% if fan.rpm %}: {{ fan.rpm }} RPM{% endif %} — {{ fan.status }}
+              </span>
+            {% endfor %}
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <div class="row" id="port-history-row">
   <div class="col-md-12">
     <div class="card mb-3 d-none" id="port-history-card">
@@ -674,6 +722,7 @@
                 <tr>
                   <th>{% trans "Interface" %}</th>
                   <th class="text-end">{% trans "Status" %}</th>
+                  <th class="text-end">{% trans "Velocidade" %}</th>
                   <th class="text-end">{% trans "VLAN (PVID)" %}</th>
                   <th class="text-end">{% trans "STP" %}</th>
                   <th class="text-end">{% trans "Download (Mbps)" %}</th>
@@ -689,14 +738,23 @@
                         <span class="badge text-bg-danger text-white ms-1">LOOP / BLOCKING</span>
                       {% endif %}
                     </td>
-                    <td class="text-end">
-                      {% if interface.status == 'UP' %}
-                        <span class="badge text-bg-success text-white">UP</span>
-                      {% else %}
-                        <span class="badge text-bg-danger text-white">DOWN</span>
-                      {% endif %}
-                    </td>
-                    <td class="text-end">{% if interface.pvid is not None %}{{ interface.pvid }}{% else %}—{% endif %}</td>
+                     <td class="text-end">
+                       {% if interface.status == 'UP' %}
+                         <span class="badge text-bg-success text-white">UP</span>
+                       {% else %}
+                         <span class="badge text-bg-danger text-white">DOWN</span>
+                       {% endif %}
+                     </td>
+                     <td class="text-end">
+                       {% if interface.status == 'UP' and interface.speed_display %}
+                         <span class="{% if interface.speed_is_fast %}text-success{% else %}text-warning{% endif %}">
+                           {{ interface.speed_display }}
+                         </span>
+                       {% else %}
+                         —
+                       {% endif %}
+                     </td>
+                     <td class="text-end">{% if interface.pvid is not None %}{{ interface.pvid }}{% else %}—{% endif %}</td>
                     <td class="text-end">
                       {% if interface.stp_state %}
                         {% if interface.stp_state == 'BLOCKING' or interface.stp_state == 'BROKEN' %}

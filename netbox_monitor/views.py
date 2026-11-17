@@ -101,6 +101,11 @@ def _interfaces_with_rates(latest, previous):
         row = dict(interface)
         row['download_mbps'] = None
         row['upload_mbps'] = None
+        row['speed_display'] = _format_speed(interface.get('speed_mbps'))
+        try:
+            row['speed_is_fast'] = float(interface.get('speed_mbps')) >= 1000
+        except (TypeError, ValueError):
+            row['speed_is_fast'] = False
         if interval:
             prev = previous_by_name.get(interface.get('name'))
             if prev:
@@ -268,6 +273,13 @@ def _port_history_series(metrics):
     }
 
 
+def _physical_interface_rows(interface_rows):
+    return [
+        row for row in interface_rows
+        if not _VIRTUAL_INTERFACE_RE.search(row.get('name') or '')
+    ]
+
+
 def _natural_sort_key(value):
     return [
         int(part) if part.isdigit() else part.lower()
@@ -298,11 +310,52 @@ def _format_rate(value):
     return f'{float(value):.2f} Mbps'
 
 
+def _format_speed(speed_mbps):
+    if speed_mbps is None:
+        return None
+    try:
+        speed = float(speed_mbps)
+    except (TypeError, ValueError):
+        return None
+    if speed <= 0:
+        return None
+    if speed >= 1000:
+        gbps = speed / 1000
+        if gbps == int(gbps):
+            return f'{int(gbps)} Gbps'
+        return f'{gbps:.1f} Gbps'
+    if speed == int(speed):
+        return f'{int(speed)} Mbps'
+    return f'{speed:.1f} Mbps'
+
+
+def _temperature_badge_class(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 'text-bg-secondary'
+    if value >= 70:
+        return 'text-bg-danger'
+    if value >= 55:
+        return 'text-bg-warning'
+    return 'text-bg-success'
+
+
+def _fan_badge_class(status):
+    return 'text-bg-success' if status == 'OK' else 'text-bg-warning'
+
+
 def _port_tooltip(interface):
     pvid = interface.get('pvid')
-    return '{} | {} | VLAN (PVID): {} | STP: {} | Download: {} | Upload: {}'.format(
+    is_up = (interface.get('status') or 'DOWN').upper() == 'UP'
+    speed = _format_speed(interface.get('speed_mbps')) if is_up else None
+    return (
+        '{} | {} | Velocidade: {} | VLAN (PVID): {} | STP: {} | '
+        'Download: {} | Upload: {}'
+    ).format(
         interface.get('name') or '—',
         interface.get('status') or 'DOWN',
+        speed or '—',
         pvid if pvid is not None else '—',
         interface.get('stp_state') or '—',
         _format_rate(interface.get('download_mbps')),
@@ -321,6 +374,7 @@ def _faceplate_port(interface, number):
         'pvid': interface.get('pvid'),
         'stp_state': stp_state,
         'is_loop': stp_state in ('BLOCKING', 'BROKEN'),
+        'speed_display': interface.get('speed_display'),
         'download_mbps': interface.get('download_mbps'),
         'upload_mbps': interface.get('upload_mbps'),
         'tooltip': _port_tooltip(interface),
@@ -381,18 +435,26 @@ def _build_faceplate(interface_rows):
         'faceplate_groups': groups,
         'faceplate_sfp_ports': sfp_ports,
         'faceplate_total': total,
+        'faceplate_copper': len(physical_ports),
         'faceplate_up': sum(1 for port in physical_ports + sfp_ports if port['is_up']),
     }
 
 
-def _chassis_model(device, latest):
+def _chassis_model(device, latest, copper_total=0):
     device_type = getattr(device, 'device_type', None)
-    model = getattr(device_type, 'model', None) if device_type is not None else None
+    model = (getattr(device_type, 'model', '') or '').strip() if device_type is not None else ''
+    name = (getattr(device, 'name', '') or '').strip()
     if model:
-        return model
+        if copper_total and name:
+            name_counts = {int(number) for number in re.findall(r'\d+', name)}
+            if copper_total in name_counts and str(copper_total) not in model:
+                return name.upper()
+        return model.upper()
+    if name:
+        return name.upper()
     sys_descr = (latest.sys_descr if latest is not None else '') or ''
     summary = re.split(r'[\n,]', sys_descr, maxsplit=1)[0].strip()
-    return summary[:48] or 'Switch'
+    return (summary[:48] or 'Switch').upper()
 
 
 def _vendor_theme(device, latest):
@@ -452,6 +514,7 @@ class MonitorView(View):
             metric = latest_metrics.get(device.pk)
             previous = previous_metrics.get(device.pk)
             interface_rows = _interfaces_with_rates(metric, previous)
+            physical_rows = _physical_interface_rows(interface_rows)
 
             rows.append({
                 'device': device,
@@ -461,10 +524,10 @@ class MonitorView(View):
                 'has_latency': bool(metric and metric.latency_ms is not None),
                 'uptime': _format_uptime(metric),
                 'active_ports': sum(
-                    1 for row in interface_rows
+                    1 for row in physical_rows
                     if (row.get('status') or '').upper() == 'UP'
                 ),
-                'total_ports': len(interface_rows),
+                'total_ports': len(physical_rows),
                 'traffic_total': _aggregate_traffic(interface_rows),
                 'stp_alert': _loop_flag(metric),
             })
@@ -589,11 +652,12 @@ class DeviceMonitorView(generic.ObjectView):
         has_traffic_history = any(value is not None for value in traffic_chart_values)
         port_history = _port_history_series(chart_metrics)
 
+        physical_interface_rows = _physical_interface_rows(interface_rows)
         active_ports = sum(
-            1 for row in interface_rows
+            1 for row in physical_interface_rows
             if (row.get('status') or '').upper() == 'UP'
         )
-        total_ports = len(interface_rows)
+        total_ports = len(physical_interface_rows)
         total_traffic_mbps = _aggregate_traffic(interface_rows)
 
         vlans_summary = []
@@ -603,6 +667,44 @@ class DeviceMonitorView(generic.ObjectView):
                 vlans_summary = latest.vlans_summary
             if isinstance(latest.loop_status, dict):
                 loop_status = latest.loop_status
+
+        hardware_metrics = {}
+        if latest is not None and isinstance(latest.hardware_metrics, dict):
+            hardware_metrics = latest.hardware_metrics
+
+        temperatures = []
+        for item in hardware_metrics.get('temperatures', []) or []:
+            if not isinstance(item, dict):
+                continue
+            temperatures.append({
+                'name': item.get('name') or 'Sensor',
+                'value_c': item.get('value_c'),
+                'badge_class': _temperature_badge_class(item.get('value_c')),
+            })
+        fans = []
+        for item in hardware_metrics.get('fans', []) or []:
+            if not isinstance(item, dict):
+                continue
+            fans.append({
+                'name': item.get('name') or 'Ventoinha',
+                'rpm': item.get('rpm'),
+                'status': item.get('status') or '—',
+                'badge_class': _fan_badge_class(item.get('status')),
+            })
+
+        has_temperatures = bool(temperatures)
+        has_fans = bool(fans)
+        has_hardware_sensors = has_temperatures or has_fans
+        max_temperature = None
+        if has_temperatures:
+            temperature_values = [
+                item['value_c'] for item in temperatures
+                if isinstance(item['value_c'], (int, float))
+            ]
+            if temperature_values:
+                max_temperature = max(temperature_values)
+
+        faceplate = _build_faceplate(interface_rows)
 
         return {
             'latest_metric': latest,
@@ -617,6 +719,12 @@ class DeviceMonitorView(generic.ObjectView):
             'interface_rows': interface_rows,
             'vlans_summary': vlans_summary,
             'loop_status': loop_status,
+            'temperatures': temperatures,
+            'fans': fans,
+            'has_temperatures': has_temperatures,
+            'has_fans': has_fans,
+            'has_hardware_sensors': has_hardware_sensors,
+            'max_temperature': max_temperature,
             'chart_labels': [
                 m.timestamp.strftime('%d/%m %H:%M:%S') for m in chart_metrics
             ],
@@ -631,11 +739,13 @@ class DeviceMonitorView(generic.ObjectView):
             'active_ports': active_ports,
             'total_ports': total_ports,
             'total_traffic_mbps': total_traffic_mbps,
-            'chassis_model': _chassis_model(instance, latest),
+            'chassis_model': _chassis_model(
+                instance, latest, faceplate['faceplate_copper']
+            ),
             'vendor_theme': vendor_theme,
             'vendor_label': _VENDOR_LABELS.get(vendor_theme, 'Switch'),
             'vendor_has_console': vendor_theme in _VENDOR_CONSOLE_THEMES,
-            **_build_faceplate(interface_rows),
+            **faceplate,
         }
 
 
