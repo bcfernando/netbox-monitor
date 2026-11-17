@@ -1,3 +1,4 @@
+import csv
 import re
 from datetime import timedelta
 
@@ -6,7 +7,8 @@ from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import Count, Q
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
@@ -68,6 +70,7 @@ _DEFAULT_RANGE = '1h'
 _MAX_CHART_POINTS = 60
 _INCIDENT_WINDOW = timedelta(hours=24)
 _INCIDENT_LIMIT = 10
+_SLA_WINDOW = timedelta(days=7)
 
 
 def _bandwidth_mbps(previous, current, interval):
@@ -345,11 +348,100 @@ def _fan_badge_class(status):
     return 'text-bg-success' if status == 'OK' else 'text-bg-warning'
 
 
+def _to_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _poe_summary(hardware_metrics):
+    if not isinstance(hardware_metrics, dict):
+        return None
+    poe = hardware_metrics.get('poe')
+    if not isinstance(poe, dict):
+        return None
+
+    budget_watts = _to_float(poe.get('budget_watts'))
+    used_watts = _to_float(poe.get('used_watts'))
+    ports = poe.get('ports') if isinstance(poe.get('ports'), dict) else {}
+    active_ports = sum(
+        1 for entry in ports.values()
+        if isinstance(entry, dict) and entry.get('active')
+    )
+
+    if budget_watts is None and used_watts is None and not active_ports:
+        return None
+
+    percent = None
+    if used_watts is not None and budget_watts is not None and budget_watts > 0:
+        percent = round(min(max(used_watts / budget_watts * 100, 0), 100), 1)
+
+    if percent is None:
+        badge_class = 'text-bg-secondary'
+        bar_class = 'bg-secondary'
+    elif percent >= 85:
+        badge_class = 'text-bg-danger'
+        bar_class = 'bg-danger'
+    elif percent >= 60:
+        badge_class = 'text-bg-warning'
+        bar_class = 'bg-warning'
+    else:
+        badge_class = 'text-bg-success'
+        bar_class = 'bg-success'
+
+    if budget_watts is not None and budget_watts.is_integer():
+        budget_watts = int(budget_watts)
+    if used_watts is not None and used_watts.is_integer():
+        used_watts = int(used_watts)
+
+    return {
+        'budget_watts': budget_watts,
+        'used_watts': used_watts,
+        'percent': percent,
+        'badge_class': badge_class,
+        'bar_class': bar_class,
+        'active_ports': active_ports,
+    }
+
+
+def _annotate_poe(interface_rows, hardware_metrics):
+    if not isinstance(hardware_metrics, dict):
+        return interface_rows
+    poe = hardware_metrics.get('poe')
+    if not isinstance(poe, dict):
+        return interface_rows
+    ports = poe.get('ports')
+    if not isinstance(ports, dict):
+        return interface_rows
+
+    normalized = {}
+    for key, entry in ports.items():
+        if isinstance(entry, dict):
+            normalized[str(key).strip()] = entry
+
+    for row in interface_rows:
+        name = (row.get('name') or '').strip()
+        status = (row.get('status') or 'DOWN').upper()
+        port_number = _port_number(name, '')
+        entry = normalized.get(port_number)
+        is_poe = bool(
+            entry
+            and entry.get('active')
+            and name.isdigit()
+            and status == 'UP'
+        )
+        row['is_poe'] = is_poe
+        row['poe_active'] = is_poe
+        row['poe_watts'] = entry.get('watts') if is_poe else None
+    return interface_rows
+
+
 def _port_tooltip(interface):
     pvid = interface.get('pvid')
     is_up = (interface.get('status') or 'DOWN').upper() == 'UP'
     speed = _format_speed(interface.get('speed_mbps')) if is_up else None
-    return (
+    tooltip = (
         '{} | {} | Velocidade: {} | VLAN (PVID): {} | STP: {} | '
         'Download: {} | Upload: {}'
     ).format(
@@ -361,6 +453,13 @@ def _port_tooltip(interface):
         _format_rate(interface.get('download_mbps')),
         _format_rate(interface.get('upload_mbps')),
     )
+    if interface.get('poe_active'):
+        watts = interface.get('poe_watts')
+        tooltip += ' | PoE: ⚡' + (f' {watts}W' if watts is not None else '')
+    tagged_vlans = interface.get('tagged_vlans') or []
+    if tagged_vlans:
+        tooltip += ' | VLANs Tagged: ' + ', '.join(str(vlan) for vlan in tagged_vlans)
+    return tooltip
 
 
 def _faceplate_port(interface, number):
@@ -372,6 +471,7 @@ def _faceplate_port(interface, number):
         'is_up': status == 'UP',
         'number': number,
         'pvid': interface.get('pvid'),
+        'tagged_vlans': interface.get('tagged_vlans') or [],
         'stp_state': stp_state,
         'is_loop': stp_state in ('BLOCKING', 'BROKEN'),
         'speed_display': interface.get('speed_display'),
@@ -483,54 +583,92 @@ def _vendor_theme(device, latest):
     return 'default'
 
 
+def _sla_badge_class(sla_percent):
+    if sla_percent is None:
+        return 'text-bg-secondary'
+    if sla_percent >= 99:
+        return 'text-bg-success'
+    if sla_percent >= 95:
+        return 'text-bg-warning'
+    return 'text-bg-danger'
+
+
+def _monitored_devices(request):
+    return list(
+        Device.objects.restrict(request.user, 'view')
+        .filter(Q(primary_ip4__isnull=False) | Q(primary_ip6__isnull=False))
+        .select_related('primary_ip4', 'primary_ip6')
+        .order_by('name')
+    )
+
+
+def _build_noc_rows(devices):
+    latest_metrics = {
+        metric.device_id: metric
+        for metric in DeviceMetric.objects.filter(device__in=devices)
+        .order_by('device_id', '-timestamp')
+        .distinct('device_id')
+    }
+
+    previous_metrics = {
+        metric.device_id: metric
+        for metric in DeviceMetric.objects.filter(device__in=devices)
+        .exclude(pk__in=[metric.pk for metric in latest_metrics.values()])
+        .order_by('device_id', '-timestamp')
+        .distinct('device_id')
+    }
+
+    sla_stats = {
+        item['device_id']: item
+        for item in DeviceMetric.objects.filter(
+            device__in=devices,
+            timestamp__gte=timezone.now() - _SLA_WINDOW,
+        )
+        .values('device_id')
+        .annotate(
+            total=Count('id'),
+            online=Count('id', filter=Q(is_online=True)),
+        )
+    }
+
+    rows = []
+    for device in devices:
+        metric = latest_metrics.get(device.pk)
+        previous = previous_metrics.get(device.pk)
+        interface_rows = _interfaces_with_rates(metric, previous)
+        physical_rows = _physical_interface_rows(interface_rows)
+
+        stats = sla_stats.get(device.pk)
+        sla_percent = None
+        if stats and stats['total']:
+            sla_percent = round(stats['online'] / stats['total'] * 100, 2)
+
+        rows.append({
+            'device': device,
+            'ip': str(device.primary_ip.address).split('/')[0] if device.primary_ip else '',
+            'metric': metric,
+            'is_online': bool(metric and metric.is_online),
+            'has_latency': bool(metric and metric.latency_ms is not None),
+            'uptime': _format_uptime(metric),
+            'active_ports': sum(
+                1 for row in physical_rows
+                if (row.get('status') or '').upper() == 'UP'
+            ),
+            'total_ports': len(physical_rows),
+            'traffic_total': _aggregate_traffic(interface_rows),
+            'stp_alert': _loop_flag(metric),
+            'sla_percent': sla_percent,
+            'sla_badge_class': _sla_badge_class(sla_percent),
+        })
+    return rows
+
+
 class MonitorView(View):
     def get(self, request):
         plugin_config = apps.get_app_config('netbox_monitor')
 
-        devices = list(
-            Device.objects.restrict(request.user, 'view')
-            .filter(Q(primary_ip4__isnull=False) | Q(primary_ip6__isnull=False))
-            .select_related('primary_ip4', 'primary_ip6')
-            .order_by('name')
-        )
-
-        latest_metrics = {
-            metric.device_id: metric
-            for metric in DeviceMetric.objects.filter(device__in=devices)
-            .order_by('device_id', '-timestamp')
-            .distinct('device_id')
-        }
-
-        previous_metrics = {
-            metric.device_id: metric
-            for metric in DeviceMetric.objects.filter(device__in=devices)
-            .exclude(pk__in=[metric.pk for metric in latest_metrics.values()])
-            .order_by('device_id', '-timestamp')
-            .distinct('device_id')
-        }
-
-        rows = []
-        for device in devices:
-            metric = latest_metrics.get(device.pk)
-            previous = previous_metrics.get(device.pk)
-            interface_rows = _interfaces_with_rates(metric, previous)
-            physical_rows = _physical_interface_rows(interface_rows)
-
-            rows.append({
-                'device': device,
-                'ip': str(device.primary_ip.address).split('/')[0] if device.primary_ip else '',
-                'metric': metric,
-                'is_online': bool(metric and metric.is_online),
-                'has_latency': bool(metric and metric.latency_ms is not None),
-                'uptime': _format_uptime(metric),
-                'active_ports': sum(
-                    1 for row in physical_rows
-                    if (row.get('status') or '').upper() == 'UP'
-                ),
-                'total_ports': len(physical_rows),
-                'traffic_total': _aggregate_traffic(interface_rows),
-                'stp_alert': _loop_flag(metric),
-            })
+        devices = _monitored_devices(request)
+        rows = _build_noc_rows(devices)
 
         online = sum(1 for row in rows if row['is_online'])
         incidents = _build_recent_incidents(
@@ -551,6 +689,49 @@ class MonitorView(View):
                 'incidents': incidents,
             },
         )
+
+
+class ExportNocCsvView(View):
+    def get(self, request):
+        devices = _monitored_devices(request)
+        rows = _build_noc_rows(devices)
+
+        response = HttpResponse(content_type='text/csv; charset=utf-8')
+        response['Content-Disposition'] = (
+            'attachment; filename="netbox_monitor_sla.csv"'
+        )
+
+        writer = csv.writer(response)
+        writer.writerow([
+            'Dispositivo',
+            'IP',
+            'Status',
+            'Latencia_ms',
+            'Uptime',
+            'Portas_Ativas',
+            'Trafego_Mbps',
+            'Loop_STP',
+            'SLA_7d',
+        ])
+        for row in rows:
+            metric = row['metric']
+            if row['stp_alert'] is None:
+                loop_stp = ''
+            else:
+                loop_stp = 'ALERTA' if row['stp_alert'] else 'Normal'
+            writer.writerow([
+                str(row['device']),
+                row['ip'],
+                'ONLINE' if row['is_online'] else 'OFFLINE',
+                metric.latency_ms if metric and metric.latency_ms is not None else '',
+                row['uptime'] if metric else '',
+                row['active_ports'] if metric else '',
+                row['traffic_total'] if row['traffic_total'] is not None else '',
+                loop_stp,
+                f"{row['sla_percent']:.2f}" if row['sla_percent'] is not None else '',
+            ])
+
+        return response
 
 
 class MonitorSettingsView(LoginRequiredMixin, View):
@@ -672,6 +853,9 @@ class DeviceMonitorView(generic.ObjectView):
         if latest is not None and isinstance(latest.hardware_metrics, dict):
             hardware_metrics = latest.hardware_metrics
 
+        poe = _poe_summary(hardware_metrics)
+        interface_rows = _annotate_poe(interface_rows, hardware_metrics)
+
         temperatures = []
         for item in hardware_metrics.get('temperatures', []) or []:
             if not isinstance(item, dict):
@@ -725,6 +909,7 @@ class DeviceMonitorView(generic.ObjectView):
             'has_fans': has_fans,
             'has_hardware_sensors': has_hardware_sensors,
             'max_temperature': max_temperature,
+            'poe': poe,
             'chart_labels': [
                 m.timestamp.strftime('%d/%m %H:%M:%S') for m in chart_metrics
             ],

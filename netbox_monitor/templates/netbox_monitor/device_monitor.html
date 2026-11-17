@@ -628,6 +628,39 @@
 </div>
 {% endif %}
 
+{% if poe %}
+<div class="row">
+  <div class="col-md-12">
+    <div class="card mb-3">
+      <h5 class="card-header">
+        <i class="mdi mdi-flash"></i> {% trans "Consumo PoE" %}
+      </h5>
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-baseline flex-wrap gap-2">
+          <div class="fs-3 fw-semibold">
+            {% if poe.used_watts is not None %}{{ poe.used_watts }}W{% else %}—{% endif %}
+            <span class="fs-6 text-muted">/ {% if poe.budget_watts is not None %}{{ poe.budget_watts }}W{% else %}—{% endif %}</span>
+          </div>
+          {% if poe.percent is not None %}
+            <span class="badge text-white {{ poe.badge_class }}">{{ poe.percent }}% {% trans "em uso" %}</span>
+          {% endif %}
+        </div>
+        {% if poe.percent is not None %}
+          <div class="progress mt-2" style="height: 6px;" role="progressbar"
+               aria-valuenow="{{ poe.percent }}" aria-valuemin="0" aria-valuemax="100">
+            <div class="progress-bar {{ poe.bar_class }}" style="width: {{ poe.percent }}%;"></div>
+          </div>
+        {% endif %}
+        <div class="text-muted small mt-2">
+          <i class="mdi mdi-power-plug"></i>
+          {{ poe.active_ports }} {% trans "porta(s) alimentando dispositivos" %}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
 <div class="row" id="port-history-row">
   <div class="col-md-12">
     <div class="card mb-3 d-none" id="port-history-card">
@@ -734,6 +767,10 @@
                   <tr class="nbx-port-row" data-port="{{ interface.name }}" style="cursor: pointer;">
                     <td>
                       {{ interface.name }}
+                      {% if interface.poe_active %}
+                        <span class="badge text-bg-primary text-white ms-1"
+                              {% if interface.poe_watts is not None %}title="{{ interface.poe_watts }} W"{% endif %}>⚡ PoE</span>
+                      {% endif %}
                       {% if interface.stp_state == 'BLOCKING' or interface.stp_state == 'BROKEN' %}
                         <span class="badge text-bg-danger text-white ms-1">LOOP / BLOCKING</span>
                       {% endif %}
@@ -754,7 +791,13 @@
                          —
                        {% endif %}
                      </td>
-                     <td class="text-end">{% if interface.pvid is not None %}{{ interface.pvid }}{% else %}—{% endif %}</td>
+                     <td class="text-end">
+                       {% if interface.pvid is not None %}{{ interface.pvid }}{% else %}—{% endif %}
+                       {% if interface.tagged_vlans %}
+                         <span class="badge text-bg-secondary text-white ms-1"
+                               title="{% trans 'VLANs Tagged' %}: {{ interface.tagged_vlans|join:', ' }}">T: {{ interface.tagged_vlans|join:', ' }}</span>
+                       {% endif %}
+                     </td>
                     <td class="text-end">
                       {% if interface.stp_state %}
                         {% if interface.stp_state == 'BLOCKING' or interface.stp_state == 'BROKEN' %}
@@ -798,11 +841,26 @@
                     <span class="text-muted small text-truncate ms-2">{{ vlan.name|default:"—" }}</span>
                   </div>
                   <div class="mt-2">
-                    {% for port in vlan.ports %}
-                      <span class="badge text-bg-secondary text-white me-1 mb-1">{{ port }}</span>
-                    {% empty %}
-                      <span class="text-muted small">{% trans "Sem portas associadas" %}</span>
-                    {% endfor %}
+                    {% if vlan.untagged_ports or vlan.tagged_ports %}
+                      <div class="text-muted small mb-1">{% trans "Untagged" %}</div>
+                      {% for port in vlan.untagged_ports %}
+                        <span class="badge text-bg-success text-white me-1 mb-1">{{ port }}</span>
+                      {% empty %}
+                        <span class="text-muted small">—</span>
+                      {% endfor %}
+                      <div class="text-muted small mt-2 mb-1">{% trans "Tagged" %}</div>
+                      {% for port in vlan.tagged_ports %}
+                        <span class="badge text-bg-secondary text-white me-1 mb-1">{{ port }}</span>
+                      {% empty %}
+                        <span class="text-muted small">—</span>
+                      {% endfor %}
+                    {% else %}
+                      {% for port in vlan.ports %}
+                        <span class="badge text-bg-secondary text-white me-1 mb-1">{{ port }}</span>
+                      {% empty %}
+                        <span class="text-muted small">{% trans "Sem portas associadas" %}</span>
+                      {% endfor %}
+                    {% endif %}
                   </div>
                 </div>
               </div>

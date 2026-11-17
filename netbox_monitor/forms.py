@@ -11,4 +11,6 @@ class MonitorSettingsForm(forms.ModelForm):
             'webhook_url',
             'telegram_chat_id',
             'retention_days',
+            'latency_threshold_ms',
+            'alert_on_uplink_down',
         )

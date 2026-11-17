@@ -66,6 +66,14 @@ class MonitorSettings(models.Model):
         default=30,
         verbose_name='Retenção do Histórico (dias)',
     )
+    latency_threshold_ms = models.PositiveIntegerField(
+        default=150,
+        verbose_name='Alerta de Latência Alta (ms) [0 = desativado]',
+    )
+    alert_on_uplink_down = models.BooleanField(
+        default=True,
+        verbose_name='Alertar queda de portas Uplink / SFP',
+    )
 
     class Meta:
         verbose_name = 'configuração do monitor'

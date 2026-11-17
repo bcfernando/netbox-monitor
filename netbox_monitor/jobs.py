@@ -1,17 +1,20 @@
 import asyncio
 import json
 import logging
+import re
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 
-from dcim.models import Device
+from dcim.models import Device, Interface
 from django.utils import timezone
 from netbox.jobs import JobRunner, system_job
 
 from .models import DeviceMetric, MonitorSettings
 
 logger = logging.getLogger(__name__)
+
+_CRITICAL_PORT_RE = re.compile(r'(?:sfp|ten|25g|40g)', re.IGNORECASE)
 
 OID_SYS_DESCR = '1.3.6.1.2.1.1.1.0'
 OID_SYS_UPTIME = '1.3.6.1.2.1.1.3.0'
@@ -44,7 +47,16 @@ OID_CISCO_ENVMON_TEMP_NAME = f'{OID_CISCO_ENVMON_TEMPERATURE}.1.1'
 OID_CISCO_ENVMON_TEMP_VALUE = f'{OID_CISCO_ENVMON_TEMPERATURE}.1.2'
 OID_CISCO_ENVMON_FAN_NAME = f'{OID_CISCO_ENVMON_FAN}.1.1'
 OID_CISCO_ENVMON_FAN_STATE = f'{OID_CISCO_ENVMON_FAN}.1.2'
+OID_PETH_MAIN_PSE_POWER = '1.3.6.1.2.1.105.1.3.1.1.2'
+OID_PETH_MAIN_PSE_CONSUMPTION = '1.3.6.1.2.1.105.1.3.1.1.4'
+OID_PETH_PSE_PORT_DETECTION_STATUS = '1.3.6.1.2.1.105.1.1.1.6'
+OID_HPE_POE_PORT_ACTUAL_POWER = '1.3.6.1.4.1.11.2.14.11.1.9.1.1.1.3'
+OID_DOT1D_BASE_PORT_IF_INDEX = '1.3.6.1.2.1.17.1.4.1.2'
 OID_DOT1Q_VLAN_STATIC_NAME = '1.3.6.1.2.1.17.7.1.4.3.1.1'
+OID_DOT1Q_VLAN_STATIC_EGRESS_PORTS = '1.3.6.1.2.1.17.7.1.4.3.1.2'
+OID_DOT1Q_VLAN_STATIC_UNTAGGED_PORTS = '1.3.6.1.2.1.17.7.1.4.3.1.4'
+OID_DOT1Q_VLAN_CURRENT_EGRESS_PORTS = '1.3.6.1.2.1.17.7.1.4.2.1.4'
+OID_DOT1Q_VLAN_CURRENT_UNTAGGED_PORTS = '1.3.6.1.2.1.17.7.1.4.2.1.5'
 OID_DOT1Q_PVID = '1.3.6.1.2.1.17.7.1.4.5.1.1'
 OID_DOT1D_STP_TOP_CHANGES = '1.3.6.1.2.1.17.2.4.0'
 OID_DOT1D_STP_TIME_SINCE_TOP_CHANGE = '1.3.6.1.2.1.17.2.3.0'
@@ -63,16 +75,19 @@ STP_RECENT_CHANGE_HUNDREDTHS = 30000
 
 SNMP_TIMEOUT = 2
 SNMP_RETRIES = 0
-SNMP_TOTAL_TIMEOUT = 8
+SNMP_TOTAL_TIMEOUT = 12
 PING_TIMEOUT = 1
 COLLECT_MAX_WORKERS = 10
 SNMP_MAX_INTERFACES = 64
 SNMP_MAX_PROCESSORS = 256
 SNMP_MAX_STORAGE_ENTRIES = 2000
 SNMP_MAX_VLANS = 512
+SNMP_MAX_BRIDGE_PORTS = 4096
 SNMP_MAX_STP_PORTS = 512
 SNMP_MAX_SENSORS = 512
+SNMP_MAX_POE_PORTS = 512
 HARDWARE_COLLECTION_TIMEOUT = 4
+POE_COLLECTION_TIMEOUT = 4
 
 ENTITY_SENSOR_TYPE_CELSIUS = 8
 ENTITY_SENSOR_TYPE_RPM = 10
@@ -142,27 +157,101 @@ def _oid_index(oid):
     return oid.rsplit('.', 1)[-1]
 
 
-async def _collect_vlans(engine, auth, target, context, index_to_name):
-    vlans_summary = []
+def _decode_port_list(value):
     try:
-        vlan_names = await _snmp_walk(
-            engine, auth, target, context, OID_DOT1Q_VLAN_STATIC_NAME, SNMP_MAX_VLANS
-        )
-    except Exception:
-        vlan_names = {}
+        octets = list(value.asNumbers())
+    except (AttributeError, TypeError, ValueError):
+        if isinstance(value, (bytes, bytearray)):
+            octets = list(value)
+        else:
+            try:
+                octets = [int(part) for part in str(value).split()]
+            except (TypeError, ValueError):
+                return set()
 
-    pvid_by_index = {}
-    try:
-        pvid_values = await _snmp_walk(
-            engine, auth, target, context, OID_DOT1Q_PVID, SNMP_MAX_VLANS
-        )
-        for oid, value in pvid_values.items():
-            vlan_id = _to_int(value)
-            if vlan_id is None:
-                continue
-            pvid_by_index[_oid_index(oid)] = vlan_id
-    except Exception:
-        pvid_by_index = {}
+    bridge_ports = set()
+    for byte_index, octet in enumerate(octets):
+        for bit in range(8):
+            if octet & (0x80 >> bit):
+                bridge_ports.add(byte_index * 8 + bit + 1)
+    return bridge_ports
+
+
+def _is_aruba_instant_on(sys_descr):
+    text = (sys_descr or '').lower()
+    return 'aruba' in text and ('instant on' in text or '1930' in text)
+
+
+def _aruba_untagged_ports_are_tagged(egress_by_vid, untagged_by_vid):
+    vlan1_untagged = untagged_by_vid.get(1, set())
+    if not vlan1_untagged:
+        return False
+    for vlan_id, ports in egress_by_vid.items():
+        if vlan_id == 1 or not ports:
+            continue
+        if not untagged_by_vid.get(vlan_id) and ports <= vlan1_untagged:
+            return True
+    return False
+
+
+def _aruba_untagged_by_vid(egress_by_vid, untagged_by_vid):
+    derived = {}
+    for vlan_id, ports in egress_by_vid.items():
+        reported = untagged_by_vid.get(vlan_id, set())
+        derived[vlan_id] = ports - (reported & ports)
+
+    others = set()
+    for vlan_id, ports in derived.items():
+        if vlan_id != 1:
+            others |= ports
+    derived[1] = untagged_by_vid.get(1, set()) - others
+    return derived
+
+
+async def _collect_vlans(engine, auth, target, context, index_to_name, sys_descr=None):
+    async def _walk(base_oid, limit=SNMP_MAX_VLANS):
+        try:
+            return await _snmp_walk(engine, auth, target, context, base_oid, limit)
+        except Exception:
+            return {}
+
+    base_port_values = await _walk(
+        OID_DOT1D_BASE_PORT_IF_INDEX, SNMP_MAX_BRIDGE_PORTS
+    )
+    bridge_port_to_index = {}
+    for oid, value in base_port_values.items():
+        bridge_port = _to_int(_oid_index(oid))
+        if_index = _to_int(value)
+        if bridge_port is not None and if_index is not None:
+            bridge_port_to_index[bridge_port] = str(if_index)
+
+    def _if_index(bridge_port):
+        return bridge_port_to_index.get(bridge_port, str(bridge_port))
+
+    vlan_names = await _walk(OID_DOT1Q_VLAN_STATIC_NAME)
+    egress_values = await _walk(OID_DOT1Q_VLAN_STATIC_EGRESS_PORTS)
+    untagged_values = await _walk(OID_DOT1Q_VLAN_STATIC_UNTAGGED_PORTS)
+    if not egress_values:
+        egress_values = await _walk(OID_DOT1Q_VLAN_CURRENT_EGRESS_PORTS)
+    if not untagged_values:
+        untagged_values = await _walk(OID_DOT1Q_VLAN_CURRENT_UNTAGGED_PORTS)
+
+    egress_by_vid = {}
+    for oid, value in egress_values.items():
+        vlan_id = _to_int(_oid_index(oid))
+        if vlan_id is not None:
+            egress_by_vid[vlan_id] = _decode_port_list(value)
+
+    untagged_by_vid = {}
+    for oid, value in untagged_values.items():
+        vlan_id = _to_int(_oid_index(oid))
+        if vlan_id is not None:
+            untagged_by_vid[vlan_id] = _decode_port_list(value)
+
+    if _is_aruba_instant_on(sys_descr) and _aruba_untagged_ports_are_tagged(
+        egress_by_vid, untagged_by_vid
+    ):
+        untagged_by_vid = _aruba_untagged_by_vid(egress_by_vid, untagged_by_vid)
 
     names = {}
     for oid, value in vlan_names.items():
@@ -170,18 +259,60 @@ async def _collect_vlans(engine, auth, target, context, index_to_name):
         if vlan_id is not None:
             names[vlan_id] = str(value)[:64]
 
-    for vlan_id in sorted(set(names) | set(pvid_by_index.values())):
-        ports = [
-            index_to_name[index]
-            for index, pvid in pvid_by_index.items()
-            if pvid == vlan_id and index in index_to_name
-        ]
+    pvid_by_index = {}
+    for vlan_id in sorted(untagged_by_vid):
+        for bridge_port in untagged_by_vid[vlan_id]:
+            index = _if_index(bridge_port)
+            if index in index_to_name and index not in pvid_by_index:
+                pvid_by_index[index] = vlan_id
+
+    pvid_values = await _walk(OID_DOT1Q_PVID)
+    for oid, value in pvid_values.items():
+        vlan_id = _to_int(value)
+        bridge_port = _to_int(_oid_index(oid))
+        if vlan_id is None or bridge_port is None:
+            continue
+        index = _if_index(bridge_port)
+        if index in index_to_name and index not in pvid_by_index:
+            pvid_by_index[index] = vlan_id
+
+    tagged_by_index = {}
+    for vlan_id in sorted(egress_by_vid):
+        tagged_ports = egress_by_vid[vlan_id] - untagged_by_vid.get(vlan_id, set())
+        for bridge_port in tagged_ports:
+            index = _if_index(bridge_port)
+            if index in index_to_name:
+                tagged_by_index.setdefault(index, []).append(vlan_id)
+
+    def _port_names(bridge_ports):
+        names_found = {
+            index_to_name[_if_index(bridge_port)]
+            for bridge_port in bridge_ports
+            if _if_index(bridge_port) in index_to_name
+        }
+        return sorted(names_found, key=str.lower)
+
+    vlan_ids = set(names) | set(egress_by_vid) | set(untagged_by_vid)
+    vlan_ids |= set(pvid_by_index.values())
+    for vlans in tagged_by_index.values():
+        vlan_ids |= set(vlans)
+
+    vlans_summary = []
+    for vlan_id in sorted(vlan_ids):
+        untagged_ports = _port_names(untagged_by_vid.get(vlan_id, set()))
+        tagged_ports = _port_names(
+            egress_by_vid.get(vlan_id, set()) - untagged_by_vid.get(vlan_id, set())
+        )
         vlans_summary.append({
             'vlan_id': vlan_id,
             'name': names.get(vlan_id) or f'VLAN {vlan_id}',
-            'ports': sorted(set(ports), key=lambda name: name.lower()),
+            'untagged_ports': untagged_ports,
+            'tagged_ports': tagged_ports,
+            'ports': sorted(
+                set(untagged_ports) | set(tagged_ports), key=str.lower
+            ),
         })
-    return vlans_summary, pvid_by_index
+    return vlans_summary, pvid_by_index, tagged_by_index
 
 
 async def _collect_loop_status(engine, auth, target, context, index_to_name):
@@ -429,6 +560,118 @@ async def _collect_hardware_metrics(engine, auth, target, context):
     return {'temperatures': temperatures, 'fans': fans}
 
 
+async def _collect_poe(engine, auth, target, context):
+    budget_watts = None
+    used_watts = None
+
+    try:
+        value = await _snmp_get(
+            engine, auth, target, context, f'{OID_PETH_MAIN_PSE_POWER}.1'
+        )
+        budget_watts = _to_int(value)
+    except Exception:
+        budget_watts = None
+
+    if budget_watts is None:
+        try:
+            budget_values = await _snmp_walk(
+                engine, auth, target, context,
+                OID_PETH_MAIN_PSE_POWER, SNMP_MAX_POE_PORTS,
+            )
+            totals = [
+                total for total in (_to_int(v) for v in budget_values.values())
+                if total is not None
+            ]
+            if totals:
+                budget_watts = sum(totals)
+        except Exception:
+            budget_watts = None
+
+    try:
+        value = await _snmp_get(
+            engine, auth, target, context, f'{OID_PETH_MAIN_PSE_CONSUMPTION}.1'
+        )
+        used_watts = _to_int(value)
+    except Exception:
+        used_watts = None
+
+    if used_watts is None:
+        try:
+            used_values = await _snmp_walk(
+                engine, auth, target, context,
+                OID_PETH_MAIN_PSE_CONSUMPTION, SNMP_MAX_POE_PORTS,
+            )
+            totals = [
+                total for total in (_to_int(v) for v in used_values.values())
+                if total is not None
+            ]
+            if totals:
+                used_watts = sum(totals)
+        except Exception:
+            used_watts = None
+
+    status_values = {}
+    try:
+        status_values = await _snmp_walk(
+            engine, auth, target, context,
+            OID_PETH_PSE_PORT_DETECTION_STATUS, SNMP_MAX_POE_PORTS,
+        )
+    except Exception:
+        status_values = {}
+
+    watts_values = {}
+    try:
+        watts_values = await _snmp_walk(
+            engine, auth, target, context,
+            OID_HPE_POE_PORT_ACTUAL_POWER, SNMP_MAX_POE_PORTS,
+        )
+    except Exception:
+        watts_values = {}
+
+    ports = {}
+    port_watts_total = 0.0
+    has_port_watts = False
+    watts_by_index = {
+        _oid_index(oid): _to_int(value)
+        for oid, value in watts_values.items()
+    }
+    for oid, value in status_values.items():
+        index = _oid_index(oid)
+        detected = _to_int(value)
+        raw_watts = watts_by_index.get(index)
+        watts = round(raw_watts / 1000, 1) if raw_watts is not None else None
+        if watts is not None:
+            port_watts_total += watts
+            has_port_watts = True
+        active = detected == 3
+        if active or (watts is not None and watts > 0):
+            ports[index] = {'active': active, 'watts': watts}
+
+    for index, raw_watts in watts_by_index.items():
+        if index in ports:
+            continue
+        if raw_watts is None:
+            continue
+        watts = round(raw_watts / 1000, 1)
+        if watts > 0:
+            ports[index] = {'active': False, 'watts': watts}
+            port_watts_total += watts
+            has_port_watts = True
+
+    if used_watts is None and has_port_watts:
+        used_watts = int(round(port_watts_total))
+
+    has_active_ports = any(port.get('active') for port in ports.values())
+    if budget_watts is None and used_watts is None and not has_active_ports:
+        return None
+
+    return {
+        'budget_watts': budget_watts,
+        'used_watts': used_watts,
+        'ports': ports,
+    }
+
+
 async def _collect_snmp_async(ip, community):
     from pysnmp.hlapi.asyncio import (
         CommunityData,
@@ -573,8 +816,8 @@ async def _collect_snmp_async(ip, community):
         _oid_index(oid): str(name)[:64] for oid, name in descr_items
     }
 
-    vlans_summary, pvid_by_index = await _collect_vlans(
-        engine, auth, target, context, index_to_name
+    vlans_summary, pvid_by_index, tagged_by_index = await _collect_vlans(
+        engine, auth, target, context, index_to_name, sys_descr
     )
     loop_status, stp_states = await _collect_loop_status(
         engine, auth, target, context, index_to_name
@@ -598,6 +841,7 @@ async def _collect_snmp_async(ip, community):
             'in_octets': _to_int(in_values.get(f'{in_oid}.{index}')),
             'out_octets': _to_int(out_values.get(f'{out_oid}.{index}')),
             'pvid': pvid_by_index.get(index),
+            'tagged_vlans': sorted(tagged_by_index.get(index, [])),
             'stp_state': stp_states.get(index),
         })
 
@@ -609,6 +853,16 @@ async def _collect_snmp_async(ip, community):
         )
     except Exception:
         hardware_metrics = {'temperatures': [], 'fans': []}
+
+    try:
+        poe = await asyncio.wait_for(
+            _collect_poe(engine, auth, target, context),
+            timeout=POE_COLLECTION_TIMEOUT,
+        )
+    except Exception:
+        poe = None
+    if poe:
+        hardware_metrics['poe'] = poe
 
     return {
         'sys_descr': sys_descr[:255] if sys_descr else None,
@@ -710,11 +964,87 @@ def _device_ip(device):
     return str(device.primary_ip.address).split('/')[0]
 
 
+def _uplink_interface_names(device):
+    names = set()
+    interfaces = Interface.objects.filter(device=device).prefetch_related('tags')
+    for interface in interfaces:
+        haystack = ' '.join(
+            filter(
+                None,
+                (
+                    interface.description or '',
+                    getattr(interface, 'label', '') or '',
+                ),
+            )
+        ).lower()
+        tagged = any(
+            'uplink' in (tag.name or '').lower() for tag in interface.tags.all()
+        )
+        if 'uplink' in haystack or tagged:
+            name = (interface.name or '').strip().lower()
+            if name:
+                names.add(name)
+    return names
+
+
+def _is_critical_port(name, uplink_names):
+    name = (name or '').strip()
+    if name.lower() in uplink_names:
+        return True
+    if _CRITICAL_PORT_RE.search(name):
+        return True
+    numbers = re.findall(r'\d+', name)
+    return bool(numbers and int(numbers[-1]) > 48)
+
+
+def _port_status_map(interfaces_summary):
+    return {
+        (interface.get('name') or '').strip(): (interface.get('status') or 'DOWN').upper()
+        for interface in interfaces_summary or []
+        if (interface.get('name') or '').strip()
+    }
+
+
+def _critical_port_alerts(device, previous, data):
+    current_summary = data.get('interfaces_summary') or []
+    previous_summary = previous.interfaces_summary or []
+    if not data.get('is_online') or not current_summary or not previous_summary:
+        return []
+
+    current_ports = _port_status_map(current_summary)
+    previous_ports = _port_status_map(previous_summary)
+    uplink_names = _uplink_interface_names(device)
+
+    alerts = []
+    for name, previous_status in previous_ports.items():
+        if not _is_critical_port(name, uplink_names):
+            continue
+        current_status = current_ports.get(name)
+        if current_status is None:
+            continue
+        if previous_status == 'UP' and current_status == 'DOWN':
+            alerts.append(
+                f'⚠️ <b>UPLINK / PORTA CRÍTICA DOWN</b>\n'
+                f'Switch: {device.name}\n'
+                f'Porta: {name}\n'
+                f'IP: {_device_ip(device)}'
+            )
+        elif previous_status == 'DOWN' and current_status == 'UP':
+            alerts.append(
+                f'✅ <b>UPLINK RESTAURADO</b>\n'
+                f'Switch: {device.name}\n'
+                f'Porta: {name}\n'
+                f'IP: {_device_ip(device)}'
+            )
+    return alerts
+
+
 def check_metric_alerts(device, data):
     previous = DeviceMetric.objects.filter(device=device).order_by('-timestamp').first()
     if previous is None:
         return
 
+    settings_obj = MonitorSettings.get_solo()
     alerts = []
     if previous.is_online and not data.get('is_online'):
         alerts.append(
@@ -729,6 +1059,29 @@ def check_metric_alerts(device, data):
             f'IP: {_device_ip(device)}'
         )
 
+    threshold = settings_obj.latency_threshold_ms or 0
+    latency_ms = data.get('latency_ms')
+    if (
+        threshold > 0
+        and data.get('is_online')
+        and latency_ms is not None
+        and latency_ms > threshold
+        and (
+            not previous.is_online
+            or (
+                previous.latency_ms is not None
+                and previous.latency_ms <= threshold
+            )
+        )
+    ):
+        alerts.append(
+            f'🟠 <b>LATÊNCIA ALTA</b>\n'
+            f'Dispositivo: {device.name}\n'
+            f'IP: {_device_ip(device)}\n'
+            f'Latência atual: {float(latency_ms):.2f} ms\n'
+            f'Limite configurado: {threshold} ms'
+        )
+
     was_loop_alert = bool((previous.loop_status or {}).get('has_alert'))
     loop_status = data.get('loop_status') or {}
     if not was_loop_alert and loop_status.get('has_alert'):
@@ -739,6 +1092,9 @@ def check_metric_alerts(device, data):
             f'IP: {_device_ip(device)}\n'
             f'Motivo: {reason}'
         )
+
+    if settings_obj.alert_on_uplink_down:
+        alerts.extend(_critical_port_alerts(device, previous, data))
 
     for message in alerts:
         send_webhook_alert(message)

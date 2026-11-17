@@ -16,6 +16,9 @@
             <i class="mdi mdi-play-circle"></i> {% trans "Coletar Todos Agora" %}
           </button>
         </form>
+        <a href="{% url 'plugins:netbox_monitor:export_csv' %}" class="btn btn-sm btn-outline-secondary">
+          <i class="mdi mdi-download"></i> {% trans "Exportar CSV" %}
+        </a>
         <div class="form-check form-switch mb-0">
           <input class="form-check-input" type="checkbox" role="switch" id="noc-auto-refresh" checked>
           <label class="form-check-label small text-muted" for="noc-auto-refresh">
@@ -66,6 +69,7 @@
             <th>{% trans "Portas Ativas" %}</th>
             <th>{% trans "Tráfego Total (Mbps)" %}</th>
             <th>{% trans "STP / Loop" %}</th>
+            <th>{% trans "SLA (7d)" %}</th>
             <th>{% trans "Última latência" %}</th>
             <th>{% trans "Última coleta" %}</th>
           </tr>
@@ -105,6 +109,11 @@
                 {% endif %}
               </td>
               <td>
+                {% if row.sla_percent is not None %}
+                  <span class="badge {{ row.sla_badge_class }} text-white">{{ row.sla_percent|floatformat:2 }}%</span>
+                {% else %}—{% endif %}
+              </td>
+              <td>
                 {% if row.has_latency %}{{ row.metric.latency_ms }} ms{% else %}—{% endif %}
               </td>
               <td>
@@ -113,7 +122,7 @@
             </tr>
           {% empty %}
             <tr>
-              <td colspan="9" class="text-center text-muted py-4">
+              <td colspan="10" class="text-center text-muted py-4">
                 {% trans "Nenhum dispositivo com IP primário encontrado." %}
               </td>
             </tr>
