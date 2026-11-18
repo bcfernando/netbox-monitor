@@ -83,6 +83,11 @@
     stroke-width: 2;
     stroke-dasharray: 7 5;
   }
+  .topo-link.is-pending {
+    stroke: #94a3b8;
+    stroke-width: 2;
+    stroke-dasharray: 4 4;
+  }
   .topo-node { cursor: pointer; transition: opacity .15s ease; }
   .topo-node.is-dim { opacity: .16; }
   .topo-node.is-match .topo-node-card {
@@ -106,6 +111,16 @@
     stroke-dasharray: 6 4;
     fill: var(--topo-offline-fill);
   }
+  .topo-node.is-pending .topo-node-card {
+    stroke: #94a3b8;
+    stroke-dasharray: 4 3;
+  }
+  .topo-node-pending {
+    fill: #64748b;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: .06em;
+  }
   .topo-node-name {
     fill: var(--topo-text);
     font-size: 13px;
@@ -125,6 +140,7 @@
   .topo-node-tag-bg { rx: 4; fill: var(--topo-tag-bg); }
   .topo-status-dot.online { fill: #22c55e; }
   .topo-status-dot.offline { fill: #ef4444; }
+  .topo-status-dot.pending { fill: #94a3b8; }
   #topo-legend {
     position: absolute;
     top: 14px;
@@ -162,6 +178,11 @@
   #topo-legend .swatch.offline {
     border-top-style: dashed;
     border-top-color: #ef4444;
+    border-top-width: 2px;
+  }
+  #topo-legend .swatch.pending {
+    border-top-style: dashed;
+    border-top-color: #94a3b8;
     border-top-width: 2px;
   }
   #topo-tooltip {
@@ -347,6 +368,7 @@
           <div><span class="swatch uplink"></span>10G+ Uplink</div>
           <div><span class="swatch"></span>1G Link</div>
           <div><span class="swatch offline"></span>Offline / Down</div>
+          <div><span class="swatch pending"></span>{% trans "Pendente / sem coleta" %}</div>
         </div>
         <svg id="topo-svg" preserveAspectRatio="xMidYMid meet">
           <defs>
@@ -410,11 +432,18 @@
 
   const NODE_W = 215;
   const NODE_H = 66;
-  const H_GAP = 32;
-  const RACK_GAP = 52;
-  const LAYER_GAP = 200;
+  const COLS_PER_ROW = 4;
+  const COL_STEP = 235;
+  const ROW_STEP = 115;
+  const RACK_PAD = 24;
+  const RACK_GAP_X = 40;
+  const RACK_GAP_Y = 40;
+  const MAX_ROW_WIDTH = 1200;
+  const RACKS_PER_ROW = 3;
+  const LAYER_GAP = 110;
   const LEFT_GUTTER = 150;
   const TOP_MARGIN = 70;
+  const LAYER_TITLES = ['CORE', 'DISTRIBUIÇÃO', 'ACESSO / SERVIDORES / APs'];
   const NAME_MAX = NODE_W - 74 - 8 - 28;
   const LAYER_BY_ROLE = { router: 0, firewall: 0, switch: 1, server: 2, ap: 2 };
   const ROLE_LABELS = {
@@ -423,6 +452,7 @@
   };
 
   const rackGroups = [];
+  const layerLabels = [];
   let nodeEls = {};
   const view = { tx: 0, ty: 0, k: 1 };
   let showExternal = showExternalInput ? showExternalInput.checked : true;
@@ -481,8 +511,13 @@
       layers[layer].push(node);
     });
 
+    let cursorY = TOP_MARGIN;
     layers.forEach(function (layerNodes, layerIndex) {
-      if (!layerNodes.length) { return; }
+      layerLabels.push({ label: LAYER_TITLES[layerIndex], y: cursorY + 22 });
+      if (!layerNodes.length) {
+        cursorY += 60;
+        return;
+      }
       const byRack = {};
       layerNodes.forEach(function (node) {
         const rack = String(node.rack || 'Sem Rack / Geral');
@@ -492,36 +527,59 @@
       const racks = Object.keys(byRack).sort(function (a, b) {
         return a.localeCompare(b, 'pt-BR');
       });
+
       let x = LEFT_GUTTER;
-      const layerY = TOP_MARGIN + layerIndex * LAYER_GAP;
+      let rowTop = cursorY;
+      let rowBottom = cursorY;
+      let racksInRow = 0;
       racks.forEach(function (rack) {
-        const list = byRack[rack].sort(function (a, b) {
+        const rackNodes = byRack[rack].sort(function (a, b) {
           return String(a.name).localeCompare(String(b.name), 'pt-BR');
         });
-        const width = list.length * NODE_W + (list.length - 1) * H_GAP + 2 * H_GAP;
-        list.forEach(function (node, index) {
-          node.x = x + H_GAP + index * (NODE_W + H_GAP);
-          node.y = layerY + 44;
+        const cols = Math.min(rackNodes.length, COLS_PER_ROW);
+        const rows = Math.ceil(rackNodes.length / cols);
+        const width = RACK_PAD * 2 + (cols - 1) * COL_STEP + NODE_W;
+        const height = 44 + (rows - 1) * ROW_STEP + NODE_H + 18;
+
+        if (
+          racksInRow > 0 &&
+          (racksInRow >= RACKS_PER_ROW ||
+            x + width > LEFT_GUTTER + MAX_ROW_WIDTH)
+        ) {
+          x = LEFT_GUTTER;
+          rowTop = rowBottom + RACK_GAP_Y;
+          racksInRow = 0;
+        }
+        const rackX = x;
+        const rackY = rowTop;
+
+        rackNodes.forEach(function (node, index) {
+          const col = index % cols;
+          const row = Math.floor(index / cols);
+          node.x = rackX + RACK_PAD + col * COL_STEP;
+          node.y = rackY + 44 + row * ROW_STEP;
         });
         rackGroups.push({
           rack: rack,
           layer: layerIndex,
-          x: x,
-          y: layerY,
+          x: rackX,
+          y: rackY,
           width: width,
-          height: NODE_H + 66
+          height: height
         });
-        x += width + RACK_GAP;
+        rowBottom = Math.max(rowBottom, rackY + height);
+        x += width + RACK_GAP_X;
+        racksInRow += 1;
       });
+      cursorY = rowBottom + LAYER_GAP;
     });
   }
 
   function drawRacks() {
     racksGroup.textContent = '';
-    ['CORE', 'DISTRIBUIÇÃO', 'ACESSO / SERVIDORES / APs'].forEach(function (label, index) {
-      const y = TOP_MARGIN + index * LAYER_GAP + 26;
-      const text = svgEl('text', { x: 22, y: y, class: 'topo-layer-label' });
-      text.textContent = label;
+    layerLabels.forEach(function (item) {
+      const text = svgEl('text', { x: 22, y: item.y, class: 'topo-layer-label' });
+      text.textContent = item.label;
       racksGroup.appendChild(text);
     });
     rackGroups.forEach(function (group) {
@@ -551,9 +609,12 @@
     nodeEls = {};
     list.forEach(function (node) {
       const role = roleKey(node);
-      const offline = node.status !== 'ONLINE';
+      const pending = node.status === 'PENDING';
+      const offline = node.status === 'OFFLINE';
       const group = svgEl('g', {
-        class: 'topo-node role-' + role + (offline ? ' is-offline' : ''),
+        class: 'topo-node role-' + role +
+          (offline ? ' is-offline' : '') +
+          (pending ? ' is-pending' : ''),
         transform: 'translate(' + node.x + ',' + node.y + ')'
       });
       group.setAttribute('data-id', String(node.id));
@@ -571,7 +632,8 @@
         cx: 16,
         cy: 18,
         r: 5,
-        class: 'topo-status-dot ' + (offline ? 'offline' : 'online')
+        class: 'topo-status-dot ' +
+          (pending ? 'pending' : (offline ? 'offline' : 'online'))
       }));
 
       group.appendChild(svgEl('rect', {
@@ -605,13 +667,27 @@
       group.appendChild(ip);
 
       const rack = svgEl('text', { x: 14, y: 57, class: 'topo-node-sub' });
-      rack.textContent = truncate(node.external ? 'Externo' : node.rack, 26);
+      rack.textContent = truncate(
+        node.external ? 'Externo' : node.rack,
+        pending ? 16 : 26
+      );
       group.appendChild(rack);
+
+      if (pending) {
+        const pendingBadge = svgEl('text', {
+          x: NODE_W - 12,
+          y: 57,
+          'text-anchor': 'end',
+          class: 'topo-node-pending'
+        });
+        pendingBadge.textContent = 'SEM COLETA';
+        group.appendChild(pendingBadge);
+      }
 
       const title = svgEl('title');
       title.textContent = node.name + '\n' + (node.ip || 'sem IP') +
         '\nRack: ' + node.rack + '\nPapel: ' + (ROLE_LABELS[role] || 'DEVICE') +
-        '\nStatus: ' + node.status;
+        '\nStatus: ' + (pending ? 'PENDENTE (sem coleta)' : node.status);
       group.appendChild(title);
 
       attachNodeEvents(group, node);
@@ -637,8 +713,14 @@
   function linkClass(link) {
     const a = nodeById[String(link.source)];
     const b = nodeById[String(link.target)];
-    if (!a || !b || a.status !== 'ONLINE' || b.status !== 'ONLINE') {
+    if (!a || !b) {
       return 'topo-link is-offline';
+    }
+    if (a.status === 'OFFLINE' || b.status === 'OFFLINE') {
+      return 'topo-link is-offline';
+    }
+    if (a.status === 'PENDING' || b.status === 'PENDING') {
+      return 'topo-link is-pending';
     }
     if (Number(link.speed_mbps) >= 10000) {
       return 'topo-link is-uplink';
@@ -859,11 +941,25 @@
       maxX = Math.max(maxX, node.x + NODE_W);
       maxY = Math.max(maxY, node.y + NODE_H);
     });
+
     const margin = 40;
+    const contentWidth = maxX - minX + margin * 2;
+    const contentHeight = maxY - minY + margin * 2;
+    const svgW = svg.clientWidth || 0;
+    const svgH = svg.clientHeight || 0;
+
+    let vbWidth = contentWidth;
+    let vbHeight = contentHeight;
+    if (svgW > 0 && svgH > 0) {
+      vbWidth = Math.max(contentWidth, svgW);
+      vbHeight = vbWidth * (svgH / svgW);
+    }
+
+    const centerX = (minX + maxX) / 2;
     svg.setAttribute(
       'viewBox',
-      (minX - margin) + ' ' + (minY - margin) + ' ' +
-      (maxX - minX + margin * 2) + ' ' + (maxY - minY + margin * 2)
+      (centerX - vbWidth / 2) + ' ' + (minY - margin) + ' ' +
+      vbWidth + ' ' + vbHeight
     );
   }
 
@@ -953,6 +1049,7 @@
     });
 
     rackGroups.length = 0;
+    layerLabels.length = 0;
     layout(visibleNodes);
     drawRacks();
     drawNodes(visibleNodes);

@@ -1631,13 +1631,19 @@ def _topology_node_payload(device, metric=None, active_ports=None):
         active_ports = _topology_active_ports(metric)
     primary_ip = getattr(device, 'primary_ip', None)
     rack = getattr(device, 'rack', None)
+    if metric is None:
+        status = 'PENDING'
+    elif metric.is_online:
+        status = 'ONLINE'
+    else:
+        status = 'OFFLINE'
     return {
         'id': str(device.pk),
         'name': str(device.name),
         'ip': str(primary_ip.address).split('/')[0] if primary_ip else '',
         'rack': getattr(rack, 'name', None) or _TOPOLOGY_DEFAULT_RACK,
         'role': _topology_role(device),
-        'status': 'ONLINE' if bool(metric and metric.is_online) else 'OFFLINE',
+        'status': status,
         'active_ports': int(active_ports or 0),
         'url': reverse('dcim:device_monitor', kwargs={'pk': device.pk}),
         'external': False,
