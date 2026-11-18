@@ -185,14 +185,17 @@ function bgauge(id,rows){var el=document.getElementById(id);
   el.innerHTML=rows.map(function(r){var c=r.value>=150?C.red:r.value>=80?C.yellow:C.green,p=Math.max(2,Math.min(100,r.value/max*100));
     return'<div><span title="'+esc(r.label)+'">'+esc(r.label)+'</span><div class="bar"><i style="width:'+p+'%;background:'+c+'"></i></div><b style="color:'+c+'">'+fmt(r.value,1)+(r.unit||"")+'</b></div>'}).join("")}
 
-function heat(id,rows,mode){var svg=mount(id),W=svg.clientWidth||600,H=svg.clientHeight||220,m={l:100,t:2,b:2};
-  if(!rows||!rows.length){emptySvg(svg,W,H,"Sem coletas");return}
+function heat(id,rows,mode){var svg=mount(id);rows=rows||[];var W=svg.clientWidth||600;
+  var h=Math.max(220,rows.length*18+24),m={l:145,t:12,b:12};
+  svg.style.height=h+"px";
+  svg.parentNode.style.overflow="auto";
+  if(!rows.length){emptySvg(svg,W,h,"Sem coletas");return}
   var cols=0;rows.forEach(function(r){cols=Math.max(cols,(r.cells||[]).length)});
-  if(!cols){emptySvg(svg,W,H,"Sem coletas");return}
-  svg.setAttribute("viewBox","0 0 "+W+" "+H);
-  var cw=(W-m.l)/cols,rh=(H-m.t-m.b)/rows.length;
+  if(!cols){emptySvg(svg,W,h,"Sem coletas");return}
+  svg.setAttribute("viewBox","0 0 "+W+" "+h);
+  var cw=(W-m.l)/cols,rh=(h-m.t-m.b)/rows.length;
   rows.forEach(function(row,y){
-    E("text",{x:m.l-6,y:m.t+y*rh+rh/2+4,"text-anchor":"end",fill:"#8e8e9e",fontSize:11},svg).textContent=row.device;
+    E("text",{x:m.l-8,y:m.t+y*rh+rh/2+3,"text-anchor":"end",fill:"#8e8e9e",fontSize:10,"white-space":"nowrap"},svg).textContent=row.device;
     for(var x=0;x<cols;x++){var cell=(row.cells||[])[x];if(!cell)continue;
       var color=cell.online?(cell.latency_ms!=null&&cell.latency_ms>=150?C.orange:C.green):C.red;
       var q=E("rect",{x:m.l+x*cw+0.5,y:m.t+y*rh+1,width:Math.max(1,cw-1),height:Math.max(1,rh-2),fill:color,opacity:mode==="timeline"?.85:.6,rx:1},svg);

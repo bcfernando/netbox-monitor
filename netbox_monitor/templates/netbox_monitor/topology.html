@@ -441,6 +441,7 @@
   const MAX_ROW_WIDTH = 1200;
   const RACKS_PER_ROW = 3;
   const LAYER_GAP = 110;
+  const LAYER_LABEL_GAP = 28;
   const LEFT_GUTTER = 150;
   const TOP_MARGIN = 70;
   const LAYER_TITLES = ['CORE', 'DISTRIBUIÇÃO', 'ACESSO / SERVIDORES / APs'];
@@ -529,8 +530,8 @@
       });
 
       let x = LEFT_GUTTER;
-      let rowTop = cursorY;
-      let rowBottom = cursorY;
+      let rowTop = cursorY + LAYER_LABEL_GAP;
+      let rowBottom = rowTop;
       let racksInRow = 0;
       racks.forEach(function (rack) {
         const rackNodes = byRack[rack].sort(function (a, b) {
@@ -578,7 +579,12 @@
   function drawRacks() {
     racksGroup.textContent = '';
     layerLabels.forEach(function (item) {
-      const text = svgEl('text', { x: 22, y: item.y, class: 'topo-layer-label' });
+      const text = svgEl('text', {
+        x: 24,
+        y: item.y,
+        'text-anchor': 'start',
+        class: 'topo-layer-label'
+      });
       text.textContent = item.label;
       racksGroup.appendChild(text);
     });
