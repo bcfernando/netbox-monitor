@@ -35,6 +35,9 @@ main{padding:12px 14px;display:grid;grid-template-columns:repeat(12,1fr);gap:8px
 .b{flex:1;min-height:0;padding:0 10px 8px;position:relative}
 .s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:span 12}
 .h1{height:120px}.h2{height:230px}.h3{height:280px}
+.p.auto{height:auto;min-height:220px;overflow:visible}
+.p.auto>.b{flex:0 0 auto;height:auto;min-height:220px;overflow:visible}
+.p.auto svg{height:auto;max-width:100%}
 .hid{display:none!important}
 svg{width:100%;height:100%;display:block}
 .stat{display:flex;flex-direction:column;justify-content:center;align-items:center;height:100%;position:relative}
@@ -186,19 +189,23 @@ function bgauge(id,rows){var el=document.getElementById(id);
     return'<div><span title="'+esc(r.label)+'">'+esc(r.label)+'</span><div class="bar"><i style="width:'+p+'%;background:'+c+'"></i></div><b style="color:'+c+'">'+fmt(r.value,1)+(r.unit||"")+'</b></div>'}).join("")}
 
 function heat(id,rows,mode){var svg=mount(id);rows=rows||[];var W=svg.clientWidth||600;
-  var h=Math.max(220,rows.length*18+24),m={l:145,t:12,b:12};
-  svg.style.height=h+"px";
-  svg.parentNode.style.overflow="auto";
-  if(!rows.length){emptySvg(svg,W,h,"Sem coletas");return}
+  var rowH=22,labelWidth=170,svgH=Math.max(220,rows.length*rowH+20);
+  svg.removeAttribute("preserveAspectRatio");
+  svg.setAttribute("height",svgH);
+  svg.style.height=svgH+"px";
+  svg.style.width="100%";
+  if(!rows.length){emptySvg(svg,W,svgH,"Sem coletas");return}
   var cols=0;rows.forEach(function(r){cols=Math.max(cols,(r.cells||[]).length)});
-  if(!cols){emptySvg(svg,W,h,"Sem coletas");return}
-  svg.setAttribute("viewBox","0 0 "+W+" "+h);
-  var cw=(W-m.l)/cols,rh=(h-m.t-m.b)/rows.length;
+  if(!cols){emptySvg(svg,W,svgH,"Sem coletas");return}
+  svg.setAttribute("viewBox","0 0 "+W+" "+svgH);
+  var cw=(W-labelWidth)/cols;
   rows.forEach(function(row,y){
-    E("text",{x:m.l-8,y:m.t+y*rh+rh/2+3,"text-anchor":"end",fill:"#8e8e9e",fontSize:10,"white-space":"nowrap"},svg).textContent=row.device;
+    var name=String(row.device==null?"":row.device);
+    if(name.length>22)name=name.slice(0,22)+"...";
+    E("text",{x:labelWidth-8,y:y*rowH+rowH/2+4,"text-anchor":"end",fill:"#8e8e9e",fontSize:11},svg).textContent=name;
     for(var x=0;x<cols;x++){var cell=(row.cells||[])[x];if(!cell)continue;
       var color=cell.online?(cell.latency_ms!=null&&cell.latency_ms>=150?C.orange:C.green):C.red;
-      var q=E("rect",{x:m.l+x*cw+0.5,y:m.t+y*rh+1,width:Math.max(1,cw-1),height:Math.max(1,rh-2),fill:color,opacity:mode==="timeline"?.85:.6,rx:1},svg);
+      var q=E("rect",{x:labelWidth+x*cw+0.5,y:y*rowH+1,width:Math.max(1,cw-1),height:Math.max(1,rowH-2),fill:color,opacity:mode==="timeline"?.85:.6,rx:1},svg);
       q.onmousemove=function(e){tip.innerHTML="<b>"+esc(row.device)+"</b><br>"+esc(this.getAttribute("data-t"))+"<br>"+(this.getAttribute("data-online")==="1"?"ONLINE":"OFFLINE")+"<br>Latência: "+fmtValue(this.getAttribute("data-lat"),1,"ms");tip.style.display="block";tip.style.left=e.clientX+14+"px";tip.style.top=e.clientY+14+"px"};
       q.onmouseleave=function(){tip.style.display="none"};
       q.setAttribute("data-t",cell.time);q.setAttribute("data-online",cell.online?"1":"0");q.setAttribute("data-lat",cell.latency_ms==null?"":cell.latency_ms);
@@ -240,7 +247,7 @@ var LAY=[
   ["s4 h2","Distribuição de status","donut","dn"],["s4 h2","Latência por dispositivo (ms)","bgauge","latb"],["s4 h2","Incidentes por hora (24h)","bars","ah"]]],
  ["Servidores","CPU · memória · disponibilidade",[
   ["s6 h2","CPU (%) — média","line","cpu"],["s6 h2","Memória (%) — média","line","mem"],
-  ["s6 h3","Mapa de calor — disponibilidade por coleta","heat","hm"],["s6 h3","Linha do tempo de estado","tl","tl"]]],
+  ["s6 auto","Mapa de calor — disponibilidade por coleta","heat","hm"],["s6 auto","Linha do tempo de estado","tl","tl"]]],
  ["Rede","tráfego · latência",[
   ["s8 h2","Tráfego (Mbps)","line","net"],["s4 h2","Latência média (ms)","line","ping"]]],
  ["Alertas","dispositivos · incidentes",[
