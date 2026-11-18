@@ -1183,30 +1183,34 @@ class SyncSnmpToNetboxView(LoginRequiredMixin, View):
 
 class CollectAllView(LoginRequiredMixin, View):
     def post(self, request, *args, **kwargs):
-        import threading, traceback
+        import threading
         from django.db import close_old_connections
+        from django.test import RequestFactory
         from dcim.models import Device
-        from .jobs import collect_snmp
+
+        user = request.user
 
         def _bg_worker():
-            try:
-                from .models import MonitorSettings
-                cfg = MonitorSettings.objects.first()
-                default_comm = getattr(cfg, 'default_snmp_community', 'public') or 'public'
-                devs = (Device.objects.filter(primary_ip4__isnull=False) | Device.objects.filter(primary_ip6__isnull=False)).distinct()
-                print(f'[NetBox Monitor] Coletando {devs.count()} dispositivos...', flush=True)
-                for d in devs:
-                    ip = str(d.primary_ip.address.ip)
-                    comm = (d.custom_field_data or {}).get('snmp_community') or default_comm
-                    collect_snmp(ip, comm)
-                print('[NetBox Monitor] Coleta em lote concluida!', flush=True)
-            except Exception:
-                traceback.print_exc()
-            finally:
-                close_old_connections()
+            rf = RequestFactory()
+            devs = (Device.objects.filter(primary_ip4__isnull=False) | Device.objects.filter(primary_ip6__isnull=False)).distinct().order_by('name')
+            total = devs.count()
+            print(f'[NetBox Monitor] Iniciando coleta completa de {total} dispositivos...', flush=True)
+            for idx, d in enumerate(devs, 1):
+                try:
+                    fake_req = rf.post(f'/plugins/monitor/device/{d.pk}/collect/')
+                    fake_req.user = user
+                    from django.contrib.messages.storage.fallback import FallbackStorage
+                    setattr(fake_req, 'session', 'session')
+                    setattr(fake_req, '_messages', FallbackStorage(fake_req))
+                    CollectNowView.as_view()(fake_req, pk=d.pk)
+                    print(f'[NetBox Monitor] [{idx}/{total}] {d.name} OK', flush=True)
+                except Exception as ex:
+                    print(f'[NetBox Monitor] [{idx}/{total}] {d.name} aviso: {ex}', flush=True)
+            close_old_connections()
+            print('[NetBox Monitor] Coleta em lote finalizada!', flush=True)
 
         threading.Thread(target=_bg_worker, daemon=True).start()
-        messages.success(request, 'Coleta em lote iniciada em segundo plano! Aguarde ~15 segundos e atualize a pagina.')
+        messages.success(request, 'Coleta em lote iniciada em segundo plano! Atualize a pagina em ~15 segundos.')
         return redirect('login')
 
 class NocTvDashboardView(LoginRequiredMixin, View):
