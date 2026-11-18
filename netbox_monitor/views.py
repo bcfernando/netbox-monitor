@@ -5,6 +5,7 @@ from datetime import timedelta
 from django.apps import apps
 from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
+from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import PermissionDenied
 from django.db import transaction
 from django.db.models import Count, Q
@@ -15,7 +16,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.views import View
 
-from dcim.models import Device, Interface
+from dcim.models import CableTermination, Device, Interface
 from ipam.models import VLAN
 from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
@@ -437,6 +438,38 @@ def _annotate_poe(interface_rows, hardware_metrics):
     return interface_rows
 
 
+def _annotate_neighbors(interface_rows, hardware_metrics):
+    if not isinstance(hardware_metrics, dict):
+        return interface_rows
+    neighbors = hardware_metrics.get('neighbors')
+    if not isinstance(neighbors, list):
+        return interface_rows
+
+    by_port = {}
+    for item in neighbors:
+        if not isinstance(item, dict):
+            continue
+        port = str(item.get('local_port') or '').strip().lower()
+        if not port:
+            continue
+        by_port.setdefault(port, item)
+        normalized = re.sub(r'[^a-z0-9]', '', port)
+        if normalized:
+            by_port.setdefault(normalized, item)
+
+    for row in interface_rows:
+        name = (row.get('name') or '').strip().lower()
+        neighbor = by_port.get(name)
+        if neighbor is None:
+            neighbor = by_port.get(re.sub(r'[^a-z0-9]', '', name))
+        row['neighbor_device'] = (
+            neighbor.get('remote_device') if neighbor else None
+        )
+        row['neighbor_port'] = neighbor.get('remote_port') if neighbor else None
+        row['neighbor_protocol'] = neighbor.get('protocol') if neighbor else None
+    return interface_rows
+
+
 def _port_tooltip(interface):
     pvid = interface.get('pvid')
     is_up = (interface.get('status') or 'DOWN').upper() == 'UP'
@@ -456,6 +489,13 @@ def _port_tooltip(interface):
     if interface.get('poe_active'):
         watts = interface.get('poe_watts')
         tooltip += ' | PoE: ⚡' + (f' {watts}W' if watts is not None else '')
+    if interface.get('neighbor_device'):
+        protocol = interface.get('neighbor_protocol') or 'LLDP'
+        remote_port = interface.get('neighbor_port') or '—'
+        tooltip += (
+            f' | Vizinho ({protocol}): {interface["neighbor_device"]}'
+            f' [{remote_port}]'
+        )
     tagged_vlans = interface.get('tagged_vlans') or []
     if tagged_vlans:
         tooltip += ' | VLANs Tagged: ' + ', '.join(str(vlan) for vlan in tagged_vlans)
@@ -477,6 +517,9 @@ def _faceplate_port(interface, number):
         'speed_display': interface.get('speed_display'),
         'download_mbps': interface.get('download_mbps'),
         'upload_mbps': interface.get('upload_mbps'),
+        'neighbor_device': interface.get('neighbor_device'),
+        'neighbor_port': interface.get('neighbor_port'),
+        'neighbor_protocol': interface.get('neighbor_protocol'),
         'tooltip': _port_tooltip(interface),
     }
 
@@ -597,7 +640,10 @@ def _monitored_devices(request):
     return list(
         Device.objects.restrict(request.user, 'view')
         .filter(Q(primary_ip4__isnull=False) | Q(primary_ip6__isnull=False))
-        .select_related('primary_ip4', 'primary_ip6', 'site')
+        .select_related(
+            'primary_ip4', 'primary_ip6', 'site', 'rack', 'role',
+            'device_type', 'device_type__manufacturer',
+        )
         .order_by('name')
     )
 
@@ -898,6 +944,7 @@ class DeviceMonitorView(generic.ObjectView):
 
         poe = _poe_summary(hardware_metrics)
         interface_rows = _annotate_poe(interface_rows, hardware_metrics)
+        interface_rows = _annotate_neighbors(interface_rows, hardware_metrics)
 
         temperatures = []
         for item in hardware_metrics.get('temperatures', []) or []:
@@ -1483,5 +1530,388 @@ class NocTvDashboardView(LoginRequiredMixin, View):
                 'selected_device': device_id,
                 'selected_range': str(minutes),
                 'noc_data': noc_data,
+            },
+        )
+
+
+_TOPOLOGY_DEFAULT_RACK = 'Sem Rack / Geral'
+_TOPOLOGY_EXTERNAL_RACK = 'Externo / Não cadastrado'
+_TOPOLOGY_ROLE_SLUGS = {
+    'swt': 'switch',
+    'sw': 'switch',
+    'switch': 'switch',
+    'rtr': 'router',
+    'router': 'router',
+    'fw': 'firewall',
+    'firewall': 'firewall',
+    'srv': 'server',
+    'server': 'server',
+    'ap': 'ap',
+    'wifi': 'ap',
+    'wireless': 'ap',
+}
+_TOPOLOGY_ROLE_KEYWORDS = (
+    ('firewall', ('firewall', 'fortigate', 'pfsense', 'sonicwall', 'fw-')),
+    ('router', ('router', 'gateway', 'edge-switch', 'routeros')),
+    ('ap', ('access point', 'wireless', 'unifi', 'wifi', 'ap-', '-ap')),
+    ('server', ('server', 'esxi', 'hypervisor', 'nas', 'srv')),
+    (
+        'switch',
+        ('switch', 'catalyst', 'aruba', 'procurve', 'edgeswitch', 'poe'),
+    ),
+)
+_CABLE_SPEED_KEYWORDS = (
+    ('100g', 100000),
+    ('40g', 40000),
+    ('25g', 25000),
+    ('10g', 10000),
+    ('5g', 5000),
+    ('2.5g', 2500),
+    ('1000base', 1000),
+    ('1g', 1000),
+    ('100base', 100),
+)
+
+
+def _topology_role(device):
+    role = getattr(device, 'role', None)
+    slug = (getattr(role, 'slug', '') or '').strip().lower()
+    mapped = _TOPOLOGY_ROLE_SLUGS.get(slug)
+    if mapped:
+        return mapped
+    haystack = ' '.join(
+        filter(
+            None,
+            (
+                slug,
+                getattr(role, 'name', '') or '',
+                str(getattr(device, 'name', '') or ''),
+                getattr(getattr(device, 'device_type', None), 'model', '') or '',
+            ),
+        )
+    ).lower()
+    for key, keywords in _TOPOLOGY_ROLE_KEYWORDS:
+        if any(keyword in haystack for keyword in keywords):
+            return key
+    return 'switch'
+
+
+def _topology_external_role(name):
+    text = (name or '').lower()
+    if any(
+        key in text
+        for key in ('ap-', '-ap', 'unifi', 'wifi', 'wireless', 'access point')
+    ):
+        return 'ap'
+    if any(key in text for key in ('firewall', 'fortigate', 'fw')):
+        return 'firewall'
+    if any(key in text for key in ('router', 'gateway', 'edge')):
+        return 'router'
+    if any(key in text for key in ('server', 'srv', 'esxi', 'nas')):
+        return 'server'
+    return 'switch'
+
+
+def _topology_slug(value):
+    slug = re.sub(r'[^a-z0-9]+', '-', (value or '').lower()).strip('-')
+    return slug or 'externo'
+
+
+def _topology_active_ports(metric):
+    if metric is None:
+        return 0
+    rows = _physical_interface_rows(_interfaces_with_rates(metric, None))
+    return sum(
+        1 for row in rows if (row.get('status') or '').upper() == 'UP'
+    )
+
+
+def _topology_node_payload(device, metric=None, active_ports=None):
+    if active_ports is None:
+        active_ports = _topology_active_ports(metric)
+    primary_ip = getattr(device, 'primary_ip', None)
+    rack = getattr(device, 'rack', None)
+    return {
+        'id': str(device.pk),
+        'name': str(device.name),
+        'ip': str(primary_ip.address).split('/')[0] if primary_ip else '',
+        'rack': getattr(rack, 'name', None) or _TOPOLOGY_DEFAULT_RACK,
+        'role': _topology_role(device),
+        'status': 'ONLINE' if bool(metric and metric.is_online) else 'OFFLINE',
+        'active_ports': int(active_ports or 0),
+        'url': reverse('dcim:device_monitor', kwargs={'pk': device.pk}),
+        'external': False,
+    }
+
+
+def _topology_external_node(name, node_id):
+    return {
+        'id': node_id,
+        'name': name,
+        'ip': '',
+        'rack': _TOPOLOGY_EXTERNAL_RACK,
+        'role': _topology_external_role(name),
+        'status': 'ONLINE',
+        'active_ports': 0,
+        'url': '',
+        'external': True,
+    }
+
+
+def _interface_speed_map(metric):
+    speeds = {}
+    if metric is None:
+        return speeds
+    for interface in metric.interfaces_summary or []:
+        name = (interface.get('name') or '').strip()
+        speed = interface.get('speed_mbps')
+        if not name or speed is None:
+            continue
+        try:
+            speed = int(float(speed))
+        except (TypeError, ValueError):
+            continue
+        if speed <= 0:
+            continue
+        speeds.setdefault(name.lower(), speed)
+        normalized = re.sub(r'[^a-z0-9]', '', name.lower())
+        if normalized:
+            speeds.setdefault(normalized, speed)
+    return speeds
+
+
+def _cable_speed_mbps(cable):
+    text = ' '.join(
+        str(part or '')
+        for part in (
+            getattr(cable, 'type', ''),
+            getattr(cable, 'label', ''),
+            getattr(cable, 'description', ''),
+        )
+    ).lower()
+    for keyword, speed in _CABLE_SPEED_KEYWORDS:
+        if keyword in text:
+            return speed
+    return None
+
+
+def _topology_cable_links(devices):
+    if not devices:
+        return []
+    interfaces = Interface.objects.filter(device__in=devices).values(
+        'pk', 'device_id', 'name'
+    )
+    interface_map = {item['pk']: item for item in interfaces}
+    if not interface_map:
+        return []
+
+    interface_ct = ContentType.objects.get_for_model(Interface)
+    terminations = CableTermination.objects.filter(
+        termination_type=interface_ct,
+        termination_id__in=interface_map.keys(),
+    ).select_related('cable')
+
+    cables = {}
+    for termination in terminations:
+        cables.setdefault(termination.cable_id, {})[
+            termination.cable_end
+        ] = termination
+
+    rows = []
+    for entries in cables.values():
+        term_a = entries.get('A')
+        term_b = entries.get('B')
+        if term_a is None or term_b is None:
+            continue
+        iface_a = interface_map.get(term_a.termination_id)
+        iface_b = interface_map.get(term_b.termination_id)
+        if iface_a is None or iface_b is None:
+            continue
+        if iface_a['device_id'] == iface_b['device_id']:
+            continue
+        rows.append((
+            str(iface_a['device_id']),
+            str(iface_b['device_id']),
+            iface_a['name'] or '',
+            iface_b['name'] or '',
+            _cable_speed_mbps(term_a.cable),
+            'NetBox Cable',
+        ))
+    return rows
+
+
+def _topology_site_options(devices):
+    sites = {}
+    for device in devices:
+        site = getattr(device, 'site', None)
+        if site is None:
+            continue
+        sites[str(site.pk)] = {
+            'id': str(site.pk),
+            'slug': site.slug,
+            'name': site.name,
+        }
+    return [
+        sites[key]
+        for key in sorted(sites, key=lambda item: sites[item]['name'].lower())
+    ]
+
+
+def _filter_topology_devices(devices, site):
+    if not site:
+        return devices
+    return [
+        device for device in devices
+        if getattr(device, 'site', None) is not None
+        and (str(device.site_id) == site or device.site.slug == site)
+    ]
+
+
+class TopologyView(View):
+    def get(self, request):
+        plugin_config = apps.get_app_config('netbox_monitor')
+        all_devices = _monitored_devices(request)
+        site_options = _topology_site_options(all_devices)
+        site_param = (request.GET.get('site') or '').strip()
+        devices = _filter_topology_devices(all_devices, site_param)
+        rows = _build_noc_rows(devices)
+
+        nodes = []
+        nodes_by_id = {}
+
+        def _register(node):
+            if node['id'] in nodes_by_id:
+                return
+            nodes_by_id[node['id']] = node
+            nodes.append(node)
+
+        for row in rows:
+            _register(_topology_node_payload(
+                row['device'],
+                row['metric'],
+                row['active_ports'],
+            ))
+
+        all_by_id = {str(device.pk): device for device in all_devices}
+        name_index = {
+            str(device.name or '').strip().lower(): str(device.pk)
+            for device in all_devices
+            if str(device.name or '').strip()
+        }
+
+        links = {}
+
+        def _add_link(source, target, source_port, target_port, speed, protocol):
+            if not source or not target or source == target:
+                return
+            key = (source, target) if source < target else (target, source)
+            if source == key[0]:
+                s_port, t_port = source_port, target_port
+            else:
+                s_port, t_port = target_port, source_port
+            link = links.get(key)
+            if link is None:
+                links[key] = {
+                    'source': key[0],
+                    'target': key[1],
+                    'source_port': s_port or '',
+                    'target_port': t_port or '',
+                    'speed_mbps': speed,
+                    'protocol': protocol,
+                }
+                return
+            if s_port:
+                link['source_port'] = s_port
+            if t_port:
+                link['target_port'] = t_port
+            if speed and (
+                link.get('speed_mbps') is None
+                or speed > link['speed_mbps']
+            ):
+                link['speed_mbps'] = speed
+            if protocol in ('LLDP', 'CDP'):
+                link['protocol'] = protocol
+
+        for cable_link in _topology_cable_links(devices):
+            _add_link(*cable_link)
+
+        metric_cache = {}
+
+        def _metric_for(device):
+            if device.pk not in metric_cache:
+                metric_cache[device.pk] = (
+                    DeviceMetric.objects.filter(device=device)
+                    .order_by('-timestamp')
+                    .first()
+                )
+            return metric_cache[device.pk]
+
+        for row in rows:
+            device = row['device']
+            source_id = str(device.pk)
+            metric = row['metric']
+            hardware = (
+                metric.hardware_metrics
+                if metric is not None
+                and isinstance(metric.hardware_metrics, dict)
+                else {}
+            )
+            neighbors = hardware.get('neighbors')
+            if not isinstance(neighbors, list):
+                continue
+            speeds = _interface_speed_map(metric)
+            for neighbor in neighbors:
+                if not isinstance(neighbor, dict):
+                    continue
+                remote_name = str(neighbor.get('remote_device') or '').strip()
+                if not remote_name:
+                    continue
+                remote_id = name_index.get(remote_name.lower())
+                if remote_id is None:
+                    remote_id = name_index.get(
+                        re.sub(r'\..*$', '', remote_name).lower()
+                    )
+                if remote_id is not None and remote_id not in nodes_by_id:
+                    remote_device = all_by_id.get(remote_id)
+                    if remote_device is not None:
+                        _register(_topology_node_payload(
+                            remote_device,
+                            _metric_for(remote_device),
+                        ))
+                if remote_id is None:
+                    remote_id = f'ext:{_topology_slug(remote_name)}'
+                    _register(_topology_external_node(remote_name, remote_id))
+                local_port = str(neighbor.get('local_port') or '').strip()
+                speed = speeds.get(local_port.lower())
+                if speed is None:
+                    speed = speeds.get(
+                        re.sub(r'[^a-z0-9]', '', local_port.lower())
+                    )
+                _add_link(
+                    source_id,
+                    remote_id,
+                    local_port,
+                    str(neighbor.get('remote_port') or ''),
+                    speed,
+                    neighbor.get('protocol') or 'LLDP',
+                )
+
+        topology_data = {
+            'nodes': nodes,
+            'links': list(links.values()),
+            'site': site_param,
+        }
+
+        return render(
+            request,
+            'netbox_monitor/topology.html',
+            {
+                'plugin_name': plugin_config.verbose_name,
+                'plugin_version': plugin_config.version,
+                'sites': site_options,
+                'selected_site': site_param,
+                'topology_data': topology_data,
+                'node_count': len(nodes),
+                'link_count': len(links),
             },
         )

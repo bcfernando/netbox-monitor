@@ -61,6 +61,12 @@ OID_DOT1Q_PVID = '1.3.6.1.2.1.17.7.1.4.5.1.1'
 OID_DOT1D_STP_TOP_CHANGES = '1.3.6.1.2.1.17.2.4.0'
 OID_DOT1D_STP_TIME_SINCE_TOP_CHANGE = '1.3.6.1.2.1.17.2.3.0'
 OID_DOT1D_STP_PORT_STATE = '1.3.6.1.2.1.17.2.15.1.3'
+OID_LLDP_REM_SYS_NAME = '1.0.8802.1.1.2.1.4.1.1.9'
+OID_LLDP_REM_PORT_ID = '1.0.8802.1.1.2.1.4.1.1.7'
+OID_LLDP_REM_PORT_DESC = '1.0.8802.1.1.2.1.4.1.1.8'
+OID_LLDP_LOC_PORT_ID = '1.0.8802.1.1.2.1.3.7.1.3'
+OID_CDP_CACHE_DEVICE_ID = '1.3.6.1.4.1.9.9.23.1.2.1.1.6'
+OID_CDP_CACHE_DEVICE_PORT = '1.3.6.1.4.1.9.9.23.1.2.1.1.7'
 
 STP_PORT_STATES = {
     1: 'DISABLED',
@@ -75,7 +81,7 @@ STP_RECENT_CHANGE_HUNDREDTHS = 30000
 
 SNMP_TIMEOUT = 2
 SNMP_RETRIES = 0
-SNMP_TOTAL_TIMEOUT = 12
+SNMP_TOTAL_TIMEOUT = 20
 PING_TIMEOUT = 1
 COLLECT_MAX_WORKERS = 10
 SNMP_MAX_INTERFACES = 64
@@ -86,8 +92,10 @@ SNMP_MAX_BRIDGE_PORTS = 4096
 SNMP_MAX_STP_PORTS = 512
 SNMP_MAX_SENSORS = 512
 SNMP_MAX_POE_PORTS = 512
+SNMP_MAX_NEIGHBORS = 512
 HARDWARE_COLLECTION_TIMEOUT = 4
 POE_COLLECTION_TIMEOUT = 4
+NEIGHBOR_COLLECTION_TIMEOUT = 6
 
 ENTITY_SENSOR_TYPE_CELSIUS = 8
 ENTITY_SENSOR_TYPE_RPM = 10
@@ -672,6 +680,120 @@ async def _collect_poe(engine, auth, target, context):
     }
 
 
+def _snmp_text(value, limit=128):
+    try:
+        numbers = list(value.asNumbers())
+    except (AttributeError, TypeError, ValueError):
+        numbers = None
+    if numbers:
+        if all(32 <= byte < 127 for byte in numbers):
+            text = ''.join(chr(byte) for byte in numbers)
+        elif len(numbers) == 6:
+            text = ':'.join(f'{byte:02x}' for byte in numbers)
+        else:
+            text = '0x' + ''.join(f'{byte:02x}' for byte in numbers)
+    else:
+        text = str(value)
+    return text.strip()[:limit]
+
+
+def _suffix_map(values, base_oid):
+    prefix = f'{base_oid}.'
+    return {
+        oid[len(prefix):]: _snmp_text(value)
+        for oid, value in values.items()
+        if oid.startswith(prefix)
+    }
+
+
+async def _collect_neighbors(engine, auth, target, context, index_to_name):
+    async def _walk(base_oid, limit=SNMP_MAX_NEIGHBORS):
+        try:
+            return await _snmp_walk(
+                engine, auth, target, context, base_oid, limit
+            )
+        except Exception:
+            return {}
+
+    loc_port_values = await _walk(OID_LLDP_LOC_PORT_ID)
+    loc_port_names = {
+        _oid_index(oid): _snmp_text(value, 64)
+        for oid, value in loc_port_values.items()
+    }
+
+    def _resolve_local_port(local_num):
+        identifier = loc_port_names.get(local_num)
+        if identifier and identifier in index_to_name:
+            return index_to_name[identifier]
+        if local_num in index_to_name:
+            return index_to_name[local_num]
+        return identifier or local_num
+
+    neighbors = []
+    seen = set()
+
+    def _add(local_port, remote_device, remote_port, protocol):
+        remote_device = (remote_device or '').strip()
+        remote_port = (remote_port or '').strip()
+        if not remote_device:
+            return
+        key = (
+            str(local_port).lower(),
+            remote_device.lower(),
+            remote_port.lower(),
+            protocol,
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        neighbors.append({
+            'local_port': str(local_port)[:64],
+            'remote_device': remote_device[:128],
+            'remote_port': remote_port[:128],
+            'protocol': protocol,
+        })
+
+    sys_names = _suffix_map(
+        await _walk(OID_LLDP_REM_SYS_NAME), OID_LLDP_REM_SYS_NAME
+    )
+    port_ids = _suffix_map(
+        await _walk(OID_LLDP_REM_PORT_ID), OID_LLDP_REM_PORT_ID
+    )
+    port_descs = _suffix_map(
+        await _walk(OID_LLDP_REM_PORT_DESC), OID_LLDP_REM_PORT_DESC
+    )
+
+    for suffix, remote_device in sys_names.items():
+        parts = suffix.split('.')
+        local_num = parts[-2] if len(parts) >= 2 else parts[-1]
+        remote_port = port_ids.get(suffix) or port_descs.get(suffix) or ''
+        _add(
+            _resolve_local_port(local_num),
+            remote_device,
+            remote_port,
+            'LLDP',
+        )
+
+    if not neighbors:
+        cdp_devices = _suffix_map(
+            await _walk(OID_CDP_CACHE_DEVICE_ID), OID_CDP_CACHE_DEVICE_ID
+        )
+        cdp_ports = _suffix_map(
+            await _walk(OID_CDP_CACHE_DEVICE_PORT), OID_CDP_CACHE_DEVICE_PORT
+        )
+        for suffix, remote_device in cdp_devices.items():
+            parts = suffix.split('.')
+            local_index = parts[-2] if len(parts) >= 2 else parts[-1]
+            _add(
+                index_to_name.get(local_index, local_index),
+                remote_device,
+                cdp_ports.get(suffix, ''),
+                'CDP',
+            )
+
+    return neighbors
+
+
 async def _collect_snmp_async(ip, community):
     from pysnmp.hlapi.asyncio import (
         CommunityData,
@@ -863,6 +985,15 @@ async def _collect_snmp_async(ip, community):
         poe = None
     if poe:
         hardware_metrics['poe'] = poe
+
+    try:
+        neighbors = await asyncio.wait_for(
+            _collect_neighbors(engine, auth, target, context, index_to_name),
+            timeout=NEIGHBOR_COLLECTION_TIMEOUT,
+        )
+    except Exception:
+        neighbors = []
+    hardware_metrics['neighbors'] = neighbors
 
     return {
         'sys_descr': sys_descr[:255] if sys_descr else None,

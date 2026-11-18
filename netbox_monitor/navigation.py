@@ -11,6 +11,10 @@ menu = PluginMenu(
                     link_text='Visão Geral',
                 ),
                 PluginMenuItem(
+                    link='plugins:netbox_monitor:topology',
+                    link_text='Topologia',
+                ),
+                PluginMenuItem(
                     link='plugins:netbox_monitor:settings',
                     link_text='Configurações',
                 ),

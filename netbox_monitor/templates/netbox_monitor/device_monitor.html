@@ -758,6 +758,7 @@
                   <th class="text-end">{% trans "Velocidade" %}</th>
                   <th class="text-end">{% trans "VLAN (PVID)" %}</th>
                   <th class="text-end">{% trans "STP" %}</th>
+                  <th>{% trans "Vizinho (LLDP)" %}</th>
                   <th class="text-end">{% trans "Download (Mbps)" %}</th>
                   <th class="text-end">{% trans "Upload (Mbps)" %}</th>
                 </tr>
@@ -798,20 +799,33 @@
                                title="{% trans 'VLANs Tagged' %}: {{ interface.tagged_vlans|join:', ' }}">T: {{ interface.tagged_vlans|join:', ' }}</span>
                        {% endif %}
                      </td>
-                    <td class="text-end">
-                      {% if interface.stp_state %}
-                        {% if interface.stp_state == 'BLOCKING' or interface.stp_state == 'BROKEN' %}
-                          <span class="badge text-bg-danger text-white">{{ interface.stp_state }}</span>
-                        {% elif interface.stp_state == 'FORWARDING' %}
-                          <span class="badge text-bg-success text-white">{{ interface.stp_state }}</span>
-                        {% else %}
-                          <span class="badge text-bg-secondary text-white">{{ interface.stp_state }}</span>
-                        {% endif %}
-                      {% else %}
-                        —
-                      {% endif %}
-                    </td>
-                    <td class="text-end">{% if interface.download_mbps is not None %}{{ interface.download_mbps|floatformat:2 }}{% else %}—{% endif %}</td>
+                     <td class="text-end">
+                       {% if interface.stp_state %}
+                         {% if interface.stp_state == 'BLOCKING' or interface.stp_state == 'BROKEN' %}
+                           <span class="badge text-bg-danger text-white">{{ interface.stp_state }}</span>
+                         {% elif interface.stp_state == 'FORWARDING' %}
+                           <span class="badge text-bg-success text-white">{{ interface.stp_state }}</span>
+                         {% else %}
+                           <span class="badge text-bg-secondary text-white">{{ interface.stp_state }}</span>
+                         {% endif %}
+                       {% else %}
+                         —
+                       {% endif %}
+                     </td>
+                     <td>
+                       {% if interface.neighbor_device %}
+                         <span class="badge text-bg-info text-white"
+                               title="{{ interface.neighbor_protocol|default:'LLDP' }} · porta {{ interface.neighbor_port|default:'—' }}">
+                           {{ interface.neighbor_device }}
+                         </span>
+                         {% if interface.neighbor_port %}
+                           <span class="text-muted small">:{{ interface.neighbor_port }}</span>
+                         {% endif %}
+                       {% else %}
+                         <span class="text-muted">—</span>
+                       {% endif %}
+                     </td>
+                     <td class="text-end">{% if interface.download_mbps is not None %}{{ interface.download_mbps|floatformat:2 }}{% else %}—{% endif %}</td>
                     <td class="text-end">{% if interface.upload_mbps is not None %}{{ interface.upload_mbps|floatformat:2 }}{% else %}—{% endif %}</td>
                   </tr>
                 {% endfor %}

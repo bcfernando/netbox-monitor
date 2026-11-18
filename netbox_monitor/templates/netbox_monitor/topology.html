@@ -1,0 +1,983 @@
+{% extends 'base/layout.html' %}
+{% load i18n %}
+
+{% block content %}
+<style>
+  .nbx-topology-wrap {
+    --topo-bg: #f8fafc;
+    --topo-grid: #cbd5e1;
+    --topo-card-bg: #ffffff;
+    --topo-border: #cbd5e1;
+    --topo-text: #0f172a;
+    --topo-muted: #475569;
+    --topo-rack-bg: rgba(241, 245, 249, 0.7);
+    --topo-rack-border: #94a3b8;
+    --topo-card-shadow: 0 1px 2px rgba(15, 23, 42, .12);
+    --topo-panel-shadow: 0 8px 24px rgba(15, 23, 42, .12);
+    --topo-offline-fill: #fef2f2;
+    --topo-match-stroke: #0f172a;
+    --topo-tag-bg: #94a3b8;
+    --topo-tag-text: #0f172a;
+    position: relative;
+    height: 76vh;
+    min-height: 520px;
+    background-color: var(--topo-bg);
+    background-image: radial-gradient(var(--topo-grid) 1px, transparent 1px);
+    background-size: 22px 22px;
+    border-radius: .5rem;
+    overflow: hidden;
+    user-select: none;
+  }
+  html[data-bs-theme="dark"] .nbx-topology-wrap {
+    --topo-bg: #0b0f19;
+    --topo-grid: #1e293b;
+    --topo-card-bg: #111827;
+    --topo-border: #1e293b;
+    --topo-text: #f8fafc;
+    --topo-muted: #94a3b8;
+    --topo-rack-bg: rgba(17, 24, 39, 0.65);
+    --topo-rack-border: #334155;
+    --topo-card-shadow: 0 1px 2px rgba(0, 0, 0, .35);
+    --topo-panel-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+    --topo-offline-fill: #2a1520;
+    --topo-match-stroke: #ffffff;
+    --topo-tag-bg: #94a3b8;
+    --topo-tag-text: #0b1220;
+  }
+  #topo-svg {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: grab;
+    touch-action: none;
+  }
+  #topo-svg.is-panning { cursor: grabbing; }
+  .topo-rack {
+    fill: var(--topo-rack-bg);
+    stroke: var(--topo-rack-border);
+    stroke-width: 1.4;
+    stroke-dasharray: 8 6;
+  }
+  .topo-rack-label {
+    fill: var(--topo-muted);
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: .04em;
+  }
+  .topo-layer-label {
+    fill: var(--topo-muted);
+    opacity: .75;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .18em;
+  }
+  .topo-link { fill: none; stroke-linecap: round; }
+  .topo-link.is-uplink {
+    stroke: #f97316;
+    stroke-width: 4.5;
+    filter: drop-shadow(0 0 3px rgba(249, 115, 22, .55));
+  }
+  .topo-link.is-1g { stroke: #22c55e; stroke-width: 2; }
+  .topo-link.is-offline {
+    stroke: #ef4444;
+    stroke-width: 2;
+    stroke-dasharray: 7 5;
+  }
+  .topo-node { cursor: pointer; transition: opacity .15s ease; }
+  .topo-node.is-dim { opacity: .16; }
+  .topo-node.is-match .topo-node-card {
+    stroke: var(--topo-match-stroke);
+    stroke-width: 3;
+  }
+  .topo-node-card {
+    fill: var(--topo-card-bg);
+    stroke-width: 2;
+    rx: 10;
+    filter: drop-shadow(var(--topo-card-shadow));
+  }
+  .topo-node.role-switch .topo-node-card { stroke: #3b82f6; }
+  .topo-node.role-router .topo-node-card { stroke: #8b5cf6; }
+  .topo-node.role-firewall .topo-node-card { stroke: #ef4444; }
+  .topo-node.role-server .topo-node-card { stroke: #14b8a6; }
+  .topo-node.role-ap .topo-node-card { stroke: #f59e0b; }
+  .topo-node.role-other .topo-node-card { stroke: #64748b; }
+  .topo-node.is-offline .topo-node-card {
+    stroke: #ef4444;
+    stroke-dasharray: 6 4;
+    fill: var(--topo-offline-fill);
+  }
+  .topo-node-name {
+    fill: var(--topo-text);
+    font-size: 13px;
+    font-weight: 700;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 145px;
+  }
+  .topo-node-sub { fill: var(--topo-muted); font-size: 11px; }
+  .topo-node-tag {
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    fill: var(--topo-tag-text);
+  }
+  .topo-node-tag-bg { rx: 4; fill: var(--topo-tag-bg); }
+  .topo-status-dot.online { fill: #22c55e; }
+  .topo-status-dot.offline { fill: #ef4444; }
+  #topo-legend {
+    position: absolute;
+    top: 14px;
+    left: 14px;
+    z-index: 5;
+    background: var(--topo-card-bg);
+    border: 1px solid var(--topo-border);
+    border-radius: .5rem;
+    padding: .6rem .8rem;
+    color: var(--topo-text);
+    font-size: .78rem;
+    line-height: 1.5;
+    pointer-events: none;
+    backdrop-filter: blur(4px);
+    box-shadow: var(--topo-card-shadow);
+  }
+  #topo-legend .topo-legend-title {
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .12em;
+    font-size: .68rem;
+    color: var(--topo-muted);
+    margin-bottom: .35rem;
+  }
+  #topo-legend .swatch {
+    display: inline-block;
+    width: 26px;
+    height: 0;
+    margin-right: .5rem;
+    vertical-align: middle;
+    border-top: 4px solid #22c55e;
+    border-radius: 2px;
+  }
+  #topo-legend .swatch.uplink { border-top-color: #f97316; }
+  #topo-legend .swatch.offline {
+    border-top-style: dashed;
+    border-top-color: #ef4444;
+    border-top-width: 2px;
+  }
+  #topo-tooltip {
+    position: absolute;
+    z-index: 20;
+    max-width: 360px;
+    background: var(--topo-card-bg);
+    border: 1px solid var(--topo-border);
+    border-radius: .4rem;
+    padding: .4rem .6rem;
+    color: var(--topo-text);
+    font-size: .78rem;
+    pointer-events: none;
+    display: none;
+    box-shadow: var(--topo-panel-shadow);
+  }
+  #topo-empty {
+    position: absolute;
+    inset: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    color: var(--topo-muted);
+    font-size: .95rem;
+  }
+  .topo-print-header { display: none; }
+
+  @media print {
+    @page { size: landscape; margin: 10mm; }
+
+    .nbx-topology-wrap,
+    html[data-bs-theme="dark"] .nbx-topology-wrap {
+      --topo-bg: #f8fafc !important;
+      --topo-grid: #cbd5e1 !important;
+      --topo-card-bg: #ffffff !important;
+      --topo-border: #cbd5e1 !important;
+      --topo-text: #0f172a !important;
+      --topo-muted: #475569 !important;
+      --topo-rack-bg: rgba(241, 245, 249, 0.7) !important;
+      --topo-rack-border: #94a3b8 !important;
+      --topo-card-shadow: none !important;
+      --topo-panel-shadow: none !important;
+      --topo-offline-fill: #fef2f2 !important;
+      --topo-match-stroke: #0f172a !important;
+      --topo-tag-bg: #94a3b8 !important;
+      --topo-tag-text: #0f172a !important;
+    }
+
+    html, body {
+      background: #ffffff !important;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+
+    aside.navbar,
+    header.navbar,
+    footer.footer,
+    .topo-page-header,
+    .card-header,
+    #topo-tooltip {
+      display: none !important;
+    }
+
+    .page,
+    .page-wrapper,
+    .page-body,
+    .tab-content,
+    .container-fluid {
+      width: 100% !important;
+      max-width: 100% !important;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+
+    .card {
+      border: 0 !important;
+      box-shadow: none !important;
+    }
+
+    .card-body { padding: 0 !important; }
+
+    .topo-print-header {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8mm;
+      padding: 0 0 2mm;
+      color: #0f172a;
+    }
+    .topo-print-header .topo-print-title {
+      font-size: 12pt;
+      font-weight: 700;
+    }
+    .topo-print-header .topo-print-meta {
+      font-size: 8.5pt;
+      color: #475569;
+    }
+
+    #topo-wrap {
+      width: 100% !important;
+      height: 175mm !important;
+      min-height: 0 !important;
+      border-radius: 0 !important;
+      break-inside: avoid;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+
+    #topo-svg {
+      width: 100% !important;
+      height: 100% !important;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+
+    #topo-legend,
+    #topo-legend * {
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+    }
+  }
+</style>
+
+<div class="container-fluid">
+  <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2 topo-page-header">
+    <div>
+      <h1 class="mb-0">{% trans "Topologia" %}</h1>
+      <div class="text-muted">
+        {{ plugin_name }} · {% trans "Vizinhos LLDP/CDP + cabos do NetBox" %}
+      </div>
+    </div>
+    <div class="d-flex align-items-center gap-2 flex-wrap">
+      <span class="badge text-bg-secondary"><span id="topo-node-count">{{ node_count }}</span> {% trans "nós" %}</span>
+      <span class="badge text-bg-secondary"><span id="topo-link-count">{{ link_count }}</span> {% trans "enlaces" %}</span>
+      <form method="get" class="d-flex align-items-center gap-2 mb-0">
+        <label class="text-muted small mb-0" for="topo-site">{% trans "Site" %}</label>
+        <select id="topo-site" name="site" class="form-select form-select-sm" onchange="this.form.submit()">
+          <option value="">{% trans "Todos os sites" %}</option>
+          {% for site in sites %}
+            <option value="{{ site.id }}" {% if site.id == selected_site or site.slug == selected_site %}selected{% endif %}>
+              {{ site.name }}
+            </option>
+          {% endfor %}
+        </select>
+      </form>
+      <a href="{% url 'plugins:netbox_monitor:monitor' %}" class="btn btn-sm btn-outline-secondary">
+        <i class="mdi mdi-arrow-left"></i> {% trans "Painel NOC" %}
+      </a>
+    </div>
+  </div>
+
+  <div class="topo-print-header">
+    <div class="topo-print-title">Topologia de Rede - NetBox Monitor</div>
+    <div class="topo-print-meta">{% trans "Exportado em" %} <span id="topo-print-stamp"></span></div>
+  </div>
+
+  <div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center gap-2 flex-wrap">
+      <div class="d-flex align-items-center gap-2">
+        <input id="topo-search" type="search" class="form-control form-control-sm"
+               style="min-width: 240px;" placeholder="{% trans 'Buscar por nome, IP, rack ou papel...' %}">
+        <button id="topo-reset" type="button" class="btn btn-sm btn-outline-secondary">
+          <i class="mdi mdi-fit-to-page-outline"></i> {% trans "Ajustar" %}
+        </button>
+        <button id="btn-export-pdf" type="button" class="btn btn-sm btn-outline-secondary">
+          <i class="mdi mdi-file-pdf-box"></i> {% trans "Exportar PDF" %}
+        </button>
+        <div class="form-check form-check-inline mb-0">
+          <input class="form-check-input" type="checkbox" id="topo-show-external" checked>
+          <label class="form-check-label small text-nowrap" for="topo-show-external">
+            {% trans "Mostrar não cadastrados (LLDP)" %}
+          </label>
+        </div>
+      </div>
+      <div class="text-muted small">
+        {% trans "Arraste os nós, use o scroll para zoom e arraste o fundo para navegar." %}
+      </div>
+    </div>
+    <div class="card-body p-0">
+      <div id="topo-wrap" class="nbx-topology-wrap">
+        <div id="topo-legend">
+          <div class="topo-legend-title">{% trans "Legenda" %}</div>
+          <div><span class="swatch uplink"></span>10G+ Uplink</div>
+          <div><span class="swatch"></span>1G Link</div>
+          <div><span class="swatch offline"></span>Offline / Down</div>
+        </div>
+        <svg id="topo-svg" preserveAspectRatio="xMidYMid meet">
+          <defs>
+            <clipPath id="topo-name-clip">
+              <rect id="topo-name-clip-rect" x="28" y="6" width="105" height="22"></rect>
+            </clipPath>
+          </defs>
+          <g id="topo-viewport">
+            <g id="topo-racks"></g>
+            <g id="topo-links"></g>
+            <g id="topo-nodes"></g>
+          </g>
+        </svg>
+        <div id="topo-tooltip"></div>
+        <div id="topo-empty">{% trans "Nenhum dispositivo monitorado para exibir." %}</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{{ topology_data|json_script:"topology-data" }}
+
+<script>
+(function () {
+  'use strict';
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const dataEl = document.getElementById('topology-data');
+  const wrap = document.getElementById('topo-wrap');
+  const svg = document.getElementById('topo-svg');
+  const viewport = document.getElementById('topo-viewport');
+  const racksGroup = document.getElementById('topo-racks');
+  const linksGroup = document.getElementById('topo-links');
+  const nodesGroup = document.getElementById('topo-nodes');
+  const tooltip = document.getElementById('topo-tooltip');
+  const emptyEl = document.getElementById('topo-empty');
+  const searchInput = document.getElementById('topo-search');
+  const resetBtn = document.getElementById('topo-reset');
+  const exportPdfBtn = document.getElementById('btn-export-pdf');
+  const printStamp = document.getElementById('topo-print-stamp');
+  const showExternalInput = document.getElementById('topo-show-external');
+  const nodeCountEl = document.getElementById('topo-node-count');
+  const linkCountEl = document.getElementById('topo-link-count');
+
+  let topology = { nodes: [], links: [] };
+  try {
+    topology = JSON.parse(dataEl ? dataEl.textContent : '{}') || topology;
+  } catch (err) {
+    topology = { nodes: [], links: [] };
+  }
+
+  const nodes = Array.isArray(topology.nodes) ? topology.nodes : [];
+  const links = Array.isArray(topology.links) ? topology.links : [];
+  const nodeById = {};
+  nodes.forEach(function (node) { nodeById[String(node.id)] = node; });
+
+  if (!nodes.length) {
+    emptyEl.style.display = 'flex';
+    return;
+  }
+
+  const NODE_W = 215;
+  const NODE_H = 66;
+  const H_GAP = 32;
+  const RACK_GAP = 52;
+  const LAYER_GAP = 200;
+  const LEFT_GUTTER = 150;
+  const TOP_MARGIN = 70;
+  const NAME_MAX = NODE_W - 74 - 8 - 28;
+  const LAYER_BY_ROLE = { router: 0, firewall: 0, switch: 1, server: 2, ap: 2 };
+  const ROLE_LABELS = {
+    router: 'ROUTER', firewall: 'FIREWALL', switch: 'SWITCH',
+    server: 'SERVER', ap: 'AP', other: 'DEVICE'
+  };
+
+  const rackGroups = [];
+  let nodeEls = {};
+  const view = { tx: 0, ty: 0, k: 1 };
+  let showExternal = showExternalInput ? showExternalInput.checked : true;
+
+  const nameClipRect = document.getElementById('topo-name-clip-rect');
+  if (nameClipRect) {
+    nameClipRect.setAttribute('width', NAME_MAX);
+  }
+
+  function svgEl(tag, attrs) {
+    const el = document.createElementNS(NS, tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (key) {
+        el.setAttribute(key, attrs[key]);
+      });
+    }
+    return el;
+  }
+
+  function truncate(value, max) {
+    const text = String(value == null ? '' : value);
+    return text.length > max ? text.slice(0, max - 1) + '…' : text;
+  }
+
+  function ellipsizeSvgText(el, maxWidth) {
+    if (!el || !el.textContent) { return; }
+    if (el.getComputedTextLength() <= maxWidth) { return; }
+    let text = el.textContent;
+    while (text.length > 1 && el.getComputedTextLength() > maxWidth) {
+      text = text.slice(0, -1);
+      el.textContent = text + '…';
+    }
+  }
+
+  function formatSpeed(speed) {
+    const value = Number(speed);
+    if (!value || isNaN(value)) { return 'velocidade não informada'; }
+    if (value >= 1000) {
+      const gbps = value / 1000;
+      return (gbps % 1 === 0 ? gbps.toFixed(0) : gbps.toFixed(1)) + ' Gbps';
+    }
+    return value.toFixed(0) + ' Mbps';
+  }
+
+  function roleKey(node) {
+    const role = String(node.role || '').toLowerCase();
+    return LAYER_BY_ROLE.hasOwnProperty(role) ? role : 'other';
+  }
+
+  function layout(list) {
+    const layers = [[], [], []];
+    list.forEach(function (node) {
+      const layer = LAYER_BY_ROLE.hasOwnProperty(roleKey(node))
+        ? LAYER_BY_ROLE[roleKey(node)]
+        : 2;
+      layers[layer].push(node);
+    });
+
+    layers.forEach(function (layerNodes, layerIndex) {
+      if (!layerNodes.length) { return; }
+      const byRack = {};
+      layerNodes.forEach(function (node) {
+        const rack = String(node.rack || 'Sem Rack / Geral');
+        if (!byRack[rack]) { byRack[rack] = []; }
+        byRack[rack].push(node);
+      });
+      const racks = Object.keys(byRack).sort(function (a, b) {
+        return a.localeCompare(b, 'pt-BR');
+      });
+      let x = LEFT_GUTTER;
+      const layerY = TOP_MARGIN + layerIndex * LAYER_GAP;
+      racks.forEach(function (rack) {
+        const list = byRack[rack].sort(function (a, b) {
+          return String(a.name).localeCompare(String(b.name), 'pt-BR');
+        });
+        const width = list.length * NODE_W + (list.length - 1) * H_GAP + 2 * H_GAP;
+        list.forEach(function (node, index) {
+          node.x = x + H_GAP + index * (NODE_W + H_GAP);
+          node.y = layerY + 44;
+        });
+        rackGroups.push({
+          rack: rack,
+          layer: layerIndex,
+          x: x,
+          y: layerY,
+          width: width,
+          height: NODE_H + 66
+        });
+        x += width + RACK_GAP;
+      });
+    });
+  }
+
+  function drawRacks() {
+    racksGroup.textContent = '';
+    ['CORE', 'DISTRIBUIÇÃO', 'ACESSO / SERVIDORES / APs'].forEach(function (label, index) {
+      const y = TOP_MARGIN + index * LAYER_GAP + 26;
+      const text = svgEl('text', { x: 22, y: y, class: 'topo-layer-label' });
+      text.textContent = label;
+      racksGroup.appendChild(text);
+    });
+    rackGroups.forEach(function (group) {
+      const rect = svgEl('rect', {
+        x: group.x,
+        y: group.y,
+        width: group.width,
+        height: group.height,
+        rx: 14,
+        class: 'topo-rack'
+      });
+      const label = svgEl('text', {
+        x: group.x + 14,
+        y: group.y + 22,
+        class: 'topo-rack-label'
+      });
+      label.textContent = /sem rack|externo/i.test(group.rack)
+        ? truncate(group.rack, 42)
+        : 'RACK · ' + truncate(group.rack, 42);
+      racksGroup.appendChild(rect);
+      racksGroup.appendChild(label);
+    });
+  }
+
+  function drawNodes(list) {
+    nodesGroup.textContent = '';
+    nodeEls = {};
+    list.forEach(function (node) {
+      const role = roleKey(node);
+      const offline = node.status !== 'ONLINE';
+      const group = svgEl('g', {
+        class: 'topo-node role-' + role + (offline ? ' is-offline' : ''),
+        transform: 'translate(' + node.x + ',' + node.y + ')'
+      });
+      group.setAttribute('data-id', String(node.id));
+
+      group.appendChild(svgEl('rect', {
+        x: 0,
+        y: 0,
+        width: NODE_W,
+        height: NODE_H,
+        rx: 10,
+        class: 'topo-node-card'
+      }));
+
+      group.appendChild(svgEl('circle', {
+        cx: 16,
+        cy: 18,
+        r: 5,
+        class: 'topo-status-dot ' + (offline ? 'offline' : 'online')
+      }));
+
+      group.appendChild(svgEl('rect', {
+        x: NODE_W - 74,
+        y: 9,
+        width: 62,
+        height: 16,
+        rx: 4,
+        class: 'topo-node-tag-bg'
+      }));
+      const tag = svgEl('text', {
+        x: NODE_W - 43,
+        y: 21,
+        'text-anchor': 'middle',
+        class: 'topo-node-tag'
+      });
+      tag.textContent = ROLE_LABELS[role] || 'DEVICE';
+      group.appendChild(tag);
+
+      const name = svgEl('text', {
+        x: 28,
+        y: 23,
+        class: 'topo-node-name',
+        'clip-path': 'url(#topo-name-clip)'
+      });
+      name.textContent = truncate(node.name, 22);
+      group.appendChild(name);
+
+      const ip = svgEl('text', { x: 14, y: 42, class: 'topo-node-sub' });
+      ip.textContent = (node.ip || 'sem IP') + ' · ' + node.active_ports + ' portas UP';
+      group.appendChild(ip);
+
+      const rack = svgEl('text', { x: 14, y: 57, class: 'topo-node-sub' });
+      rack.textContent = truncate(node.external ? 'Externo' : node.rack, 26);
+      group.appendChild(rack);
+
+      const title = svgEl('title');
+      title.textContent = node.name + '\n' + (node.ip || 'sem IP') +
+        '\nRack: ' + node.rack + '\nPapel: ' + (ROLE_LABELS[role] || 'DEVICE') +
+        '\nStatus: ' + node.status;
+      group.appendChild(title);
+
+      attachNodeEvents(group, node);
+      nodesGroup.appendChild(group);
+      ellipsizeSvgText(name, NAME_MAX);
+      nodeEls[String(node.id)] = group;
+    });
+  }
+
+  function linkPath(a, b) {
+    const ax = a.x + NODE_W / 2;
+    const bx = b.x + NODE_W / 2;
+    const aCenter = a.y + NODE_H / 2;
+    const bCenter = b.y + NODE_H / 2;
+    const goingDown = bCenter >= aCenter;
+    const ay = goingDown ? a.y + NODE_H : a.y;
+    const by = goingDown ? b.y : b.y + NODE_H;
+    const mid = (ay + by) / 2;
+    return 'M' + ax + ',' + ay +
+      ' C' + ax + ',' + mid + ' ' + bx + ',' + mid + ' ' + bx + ',' + by;
+  }
+
+  function linkClass(link) {
+    const a = nodeById[String(link.source)];
+    const b = nodeById[String(link.target)];
+    if (!a || !b || a.status !== 'ONLINE' || b.status !== 'ONLINE') {
+      return 'topo-link is-offline';
+    }
+    if (Number(link.speed_mbps) >= 10000) {
+      return 'topo-link is-uplink';
+    }
+    return 'topo-link is-1g';
+  }
+
+  function linkLabel(link) {
+    const a = nodeById[String(link.source)];
+    const b = nodeById[String(link.target)];
+    const nameA = a ? a.name : String(link.source);
+    const nameB = b ? b.name : String(link.target);
+    return nameA + ' [' + (link.source_port || '—') + '] ' +
+      '\u2194 ' + nameB + ' [' + (link.target_port || '—') + ']' +
+      ' · ' + (link.protocol || '—') + ' · ' + formatSpeed(link.speed_mbps);
+  }
+
+  function drawLinks(list) {
+    linksGroup.textContent = '';
+    list.forEach(function (link) {
+      const a = nodeById[String(link.source)];
+      const b = nodeById[String(link.target)];
+      if (!a || !b) { return; }
+      const path = svgEl('path', {
+        d: linkPath(a, b),
+        class: linkClass(link)
+      });
+      const title = svgEl('title');
+      title.textContent = linkLabel(link);
+      path.appendChild(title);
+      path.addEventListener('pointerenter', function (event) {
+        showTooltip(event, linkLabel(link));
+      });
+      path.addEventListener('pointermove', function (event) {
+        positionTooltip(event);
+      });
+      path.addEventListener('pointerleave', hideTooltip);
+      linksGroup.appendChild(path);
+    });
+  }
+
+  function showTooltip(event, text) {
+    tooltip.textContent = text;
+    tooltip.style.display = 'block';
+    positionTooltip(event);
+  }
+
+  function positionTooltip(event) {
+    const box = wrap.getBoundingClientRect();
+    let left = event.clientX - box.left + 16;
+    let top = event.clientY - box.top + 16;
+    const maxLeft = box.width - tooltip.offsetWidth - 12;
+    const maxTop = box.height - tooltip.offsetHeight - 12;
+    left = Math.max(8, Math.min(left, maxLeft));
+    top = Math.max(8, Math.min(top, maxTop));
+    tooltip.style.left = left + 'px';
+    tooltip.style.top = top + 'px';
+  }
+
+  function hideTooltip() {
+    tooltip.style.display = 'none';
+  }
+
+  function applyView() {
+    viewport.setAttribute(
+      'transform',
+      'translate(' + view.tx + ',' + view.ty + ') scale(' + view.k + ')'
+    );
+  }
+
+  function clientToSvg(event) {
+    const point = svg.createSVGPoint();
+    point.x = event.clientX;
+    point.y = event.clientY;
+    return point.matrixTransform(svg.getScreenCTM().inverse());
+  }
+
+  function graphPoint(event) {
+    const point = clientToSvg(event);
+    return {
+      x: (point.x - view.tx) / view.k,
+      y: (point.y - view.ty) / view.k
+    };
+  }
+
+  let drag = null;
+  let pan = null;
+
+  function attachNodeEvents(el, node) {
+    el.addEventListener('pointerdown', function (event) {
+      if (event.button !== 0) { return; }
+      event.stopPropagation();
+      hideTooltip();
+      const start = graphPoint(event);
+      drag = {
+        node: node,
+        el: el,
+        startX: start.x,
+        startY: start.y,
+        originX: node.x,
+        originY: node.y,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        moved: false
+      };
+      svg.setPointerCapture(event.pointerId);
+    });
+  }
+
+  svg.addEventListener('pointerdown', function (event) {
+    if (event.button !== 0) { return; }
+    hideTooltip();
+    const ctm = svg.getScreenCTM();
+    pan = {
+      clientX: event.clientX,
+      clientY: event.clientY,
+      tx: view.tx,
+      ty: view.ty,
+      scale: ctm ? ctm.a : 1
+    };
+    svg.classList.add('is-panning');
+    svg.setPointerCapture(event.pointerId);
+  });
+
+  window.addEventListener('pointermove', function (event) {
+    if (drag) {
+      const moved = drag.moved ||
+        Math.abs(event.clientX - drag.clientX) > 3 ||
+        Math.abs(event.clientY - drag.clientY) > 3;
+      drag.moved = moved;
+      if (!moved) { return; }
+      const point = graphPoint(event);
+      drag.node.x = drag.originX + (point.x - drag.startX);
+      drag.node.y = drag.originY + (point.y - drag.startY);
+      drag.el.setAttribute(
+        'transform',
+        'translate(' + drag.node.x + ',' + drag.node.y + ')'
+      );
+      drawLinks();
+      return;
+    }
+    if (pan) {
+      const scale = pan.scale || 1;
+      view.tx = pan.tx + (event.clientX - pan.clientX) / scale;
+      view.ty = pan.ty + (event.clientY - pan.clientY) / scale;
+      applyView();
+    }
+  });
+
+  window.addEventListener('pointerup', function () {
+    if (drag) {
+      const node = drag.node;
+      const moved = drag.moved;
+      drag = null;
+      if (!moved && node.url) {
+        window.location.href = node.url;
+      }
+    }
+    if (pan) {
+      pan = null;
+      svg.classList.remove('is-panning');
+    }
+  });
+
+  svg.addEventListener('wheel', function (event) {
+    event.preventDefault();
+    const point = clientToSvg(event);
+    const graphX = (point.x - view.tx) / view.k;
+    const graphY = (point.y - view.ty) / view.k;
+    const factor = event.deltaY < 0 ? 1.15 : 1 / 1.15;
+    const nextK = Math.min(3, Math.max(0.25, view.k * factor));
+    view.tx = point.x - graphX * nextK;
+    view.ty = point.y - graphY * nextK;
+    view.k = nextK;
+    applyView();
+  }, { passive: false });
+
+  function applySearch(query) {
+    const term = String(query || '').trim().toLowerCase();
+    nodes.forEach(function (node) {
+      const el = nodeEls[String(node.id)];
+      if (!el) { return; }
+      const haystack = [node.name, node.ip, node.rack, node.role]
+        .join(' ').toLowerCase();
+      const match = !term || haystack.indexOf(term) !== -1;
+      el.classList.toggle('is-dim', !match);
+      el.classList.toggle('is-match', !!term && match);
+    });
+  }
+
+  searchInput.addEventListener('input', function () {
+    applySearch(searchInput.value);
+  });
+
+  resetBtn.addEventListener('click', function () {
+    view.tx = 0;
+    view.ty = 0;
+    view.k = 1;
+    applyView();
+    if (searchInput.value) {
+      searchInput.value = '';
+      applySearch('');
+    }
+  });
+
+  function fitViewBox(list) {
+    let minX = 0;
+    let minY = 0;
+    let maxX = 0;
+    let maxY = 0;
+    rackGroups.forEach(function (group) {
+      minX = Math.min(minX, group.x);
+      minY = Math.min(minY, group.y);
+      maxX = Math.max(maxX, group.x + group.width);
+      maxY = Math.max(maxY, group.y + group.height);
+    });
+    list.forEach(function (node) {
+      maxX = Math.max(maxX, node.x + NODE_W);
+      maxY = Math.max(maxY, node.y + NODE_H);
+    });
+    const margin = 40;
+    svg.setAttribute(
+      'viewBox',
+      (minX - margin) + ' ' + (minY - margin) + ' ' +
+      (maxX - minX + margin * 2) + ' ' + (maxY - minY + margin * 2)
+    );
+  }
+
+  function fitView() {
+    const visibleNodes = showExternal
+      ? nodes
+      : nodes.filter(function (node) { return !node.external; });
+    view.tx = 0;
+    view.ty = 0;
+    view.k = 1;
+    applyView();
+    fitViewBox(visibleNodes);
+    if (searchInput.value) {
+      searchInput.value = '';
+      applySearch('');
+    }
+  }
+
+  function setPrintStamp() {
+    if (!printStamp) { return; }
+    printStamp.textContent = new Date().toLocaleString('pt-BR');
+  }
+
+  if (exportPdfBtn) {
+    exportPdfBtn.addEventListener('click', function () {
+      setPrintStamp();
+      fitView();
+      window.setTimeout(function () {
+        window.print();
+      }, 150);
+    });
+  }
+
+  window.addEventListener('beforeprint', function () {
+    applyTheme();
+    if (printStamp && !printStamp.textContent.trim()) {
+      setPrintStamp();
+    }
+  });
+
+  window.addEventListener('afterprint', applyTheme);
+
+  function currentTheme() {
+    return document.documentElement.getAttribute('data-bs-theme') === 'dark'
+      ? 'dark'
+      : 'light';
+  }
+
+  function applyTheme() {
+    const theme = currentTheme();
+    wrap.setAttribute('data-topo-theme', theme);
+    const styles = window.getComputedStyle(wrap);
+    const tagBg = styles.getPropertyValue('--topo-tag-bg').trim();
+    const tagText = styles.getPropertyValue('--topo-tag-text').trim();
+    nodesGroup.querySelectorAll('.topo-node-tag-bg').forEach(function (el) {
+      if (tagBg) { el.setAttribute('fill', tagBg); }
+    });
+    nodesGroup.querySelectorAll('.topo-node-tag').forEach(function (el) {
+      if (tagText) { el.style.fill = tagText; }
+    });
+    hideTooltip();
+  }
+
+  const themeObserver = new MutationObserver(function () {
+    applyTheme();
+  });
+  themeObserver.observe(document.documentElement, {
+    attributes: true,
+    attributeFilter: ['data-bs-theme']
+  });
+
+  function updateCounts(visibleNodes, visibleLinks) {
+    if (nodeCountEl) { nodeCountEl.textContent = String(visibleNodes.length); }
+    if (linkCountEl) { linkCountEl.textContent = String(visibleLinks.length); }
+  }
+
+  function rebuild() {
+    const visibleNodes = showExternal
+      ? nodes
+      : nodes.filter(function (node) { return !node.external; });
+    const visibleIds = {};
+    visibleNodes.forEach(function (node) {
+      visibleIds[String(node.id)] = true;
+    });
+    const visibleLinks = links.filter(function (link) {
+      return visibleIds[String(link.source)] && visibleIds[String(link.target)];
+    });
+
+    rackGroups.length = 0;
+    layout(visibleNodes);
+    drawRacks();
+    drawNodes(visibleNodes);
+    drawLinks(visibleLinks);
+    fitViewBox(visibleNodes);
+    updateCounts(visibleNodes, visibleLinks);
+    applySearch(searchInput.value);
+    applyTheme();
+
+    if (!visibleNodes.length) {
+      emptyEl.style.display = 'flex';
+    } else {
+      emptyEl.style.display = 'none';
+    }
+  }
+
+  if (showExternalInput) {
+    showExternalInput.addEventListener('change', function () {
+      showExternal = showExternalInput.checked;
+      rebuild();
+    });
+  }
+
+  rebuild();
+  applyView();
+})();
+</script>
+{% endblock %}
