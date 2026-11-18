@@ -1185,21 +1185,16 @@ class CollectAllView(LoginRequiredMixin, View):
     def post(self, request, *args, **kwargs):
         import threading
         from django.db import close_old_connections
-        from .jobs import collect_all_devices
+        from dcim.models import Device
+        from .jobs import collect_snmp
 
         def _bg_worker():
             try:
-                collect_all_devices()
+                [ collect_snmp(d) for d in (Device.objects.filter(primary_ip4__isnull=False) | Device.objects.filter(primary_ip6__isnull=False)).distinct() ]
             finally:
                 close_old_connections()
 
-        try:
-            import django_rq
-            queue = django_rq.get_queue('default')
-            queue.enqueue(collect_all_devices)
-        except Exception:
-            threading.Thread(target=_bg_worker, daemon=True).start()
-
+        threading.Thread(target=_bg_worker, daemon=True).start()
         messages.success(request, 'Coleta em lote iniciada em segundo plano! Atualize a pagina em alguns segundos.')
         return redirect('login')
 
