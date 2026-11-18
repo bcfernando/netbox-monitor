@@ -1,0 +1,327 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NetBox Monitor · NOC TV</title>
+<style>
+:root{--bg:#0b0c0e;--panel:#181b1f;--head:#1f2228;--border:#2c3235;--text:#ccccdc;--muted:#8e8e9e;--grid:#2a2d33;
+--green:#73bf69;--yellow:#f2cc0c;--red:#f2495c;--blue:#5794f2;--orange:#ff9830;--purple:#b877d9;--cyan:#4fd1c5}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--text);font:12.5px/1.4 Inter,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+.nav{display:flex;flex-wrap:wrap;gap:8px;align-items:center;padding:8px 14px;background:#111217;border-bottom:1px solid var(--border);position:sticky;top:0;z-index:5}
+.logo{width:22px;height:22px;border-radius:50%;background:conic-gradient(var(--orange),var(--red),var(--orange))}
+.nav h1{font-size:15px;font-weight:500;margin:0 10px 0 2px}
+.crumb{color:var(--muted)}
+.sp{flex:1}
+.v{display:flex;border:1px solid var(--border);border-radius:2px;overflow:hidden}
+.v span{padding:4px 8px;background:var(--head);color:var(--muted);white-space:nowrap}
+.v select{background:var(--bg);color:var(--text);border:0;padding:4px 8px;font:inherit}
+.btn{background:var(--head);color:var(--text);border:1px solid var(--border);border-radius:2px;padding:4px 10px;font:inherit;cursor:pointer;text-decoration:none}
+.btn:hover{border-color:var(--blue)}
+.btn:focus-visible,select:focus-visible{outline:2px solid var(--blue)}
+.live{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px;animation:p 2s infinite}
+@keyframes p{50%{opacity:.35}}
+@media(prefers-reduced-motion:reduce){.live{animation:none}}
+main{padding:12px 14px;display:grid;grid-template-columns:repeat(12,1fr);gap:8px}
+.row{grid-column:1/-1;display:flex;align-items:center;gap:8px;padding:6px 2px;cursor:pointer;font-size:14px;font-weight:500;user-select:none}
+.row:hover{background:#ffffff05}
+.row b{color:var(--muted);font-weight:400;font-size:12px}
+.row .ar{display:inline-block;transition:transform .15s}
+.row.c .ar{transform:rotate(-90deg)}
+.p{background:var(--panel);border:1px solid var(--border);border-radius:2px;min-width:0;display:flex;flex-direction:column;position:relative}
+.p>h2{margin:0;padding:7px 10px;font-size:12.5px;font-weight:500;display:flex;justify-content:space-between}
+.p>h2 em{font-style:normal;color:var(--muted);font-weight:400}
+.b{flex:1;min-height:0;padding:0 10px 8px;position:relative}
+.s2{grid-column:span 2}.s3{grid-column:span 3}.s4{grid-column:span 4}.s6{grid-column:span 6}.s8{grid-column:span 8}.s12{grid-column:span 12}
+.h1{height:120px}.h2{height:230px}.h3{height:280px}
+.hid{display:none!important}
+svg{width:100%;height:100%;display:block}
+.stat{display:flex;flex-direction:column;justify-content:center;align-items:center;height:100%;position:relative}
+.stat .v1{font-size:34px;font-weight:500;line-height:1;position:relative;z-index:1;text-align:center}
+.stat .l{color:var(--muted);position:relative;z-index:1;margin-top:2px}
+.stat svg{position:absolute;inset:0;opacity:.9}
+.leg{display:flex;flex-wrap:wrap;gap:12px;color:var(--muted);padding:2px 0 0}
+.leg i{display:inline-block;width:10px;height:3px;margin-right:5px;vertical-align:middle;border-radius:1px}
+table{width:100%;border-collapse:collapse}
+th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--border);white-space:nowrap}
+th{color:var(--blue);font-weight:500;position:sticky;top:0;background:var(--panel)}
+tr:hover td{background:#ffffff08}
+.sc{overflow:auto;height:100%}
+.pill{display:inline-block;min-width:62px;text-align:center;padding:1px 6px;border-radius:2px;color:#111;font-weight:600;font-size:11px}
+.OK,.UP{background:var(--green)}.WARNING{background:var(--yellow)}.CRITICAL,.DOWN{background:var(--red)}.UNKNOWN{background:var(--blue)}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--muted);font-size:11.5px}
+.bg{display:flex;flex-direction:column;justify-content:space-around;height:100%;gap:6px;padding-top:2px}
+.bg>div{display:grid;grid-template-columns:90px 1fr 60px;gap:8px;align-items:center}
+.bg span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.bar{height:18px;background:#22252b;border-radius:2px;overflow:hidden}
+.bar i{display:block;height:100%}
+.cell{display:flex;align-items:center;gap:6px}.cell .bar{width:80px;height:10px}
+.tip{position:fixed;pointer-events:none;background:#000e;border:1px solid var(--border);padding:6px 9px;border-radius:2px;display:none;z-index:20;font-size:12px}
+@media(max-width:1000px){.s2,.s3,.s4{grid-column:span 6}.s6,.s8{grid-column:span 12}}
+@media(max-width:560px){.s2,.s3,.s4{grid-column:span 12}}
+</style>
+</head>
+<body>
+<header class="nav">
+  <div class="logo"></div><h1>NetBox Monitor <span class="crumb">/ NOC / Visão geral</span></h1>
+  <label class="v"><span>site</span><select id="site">
+    <option value="">Todos</option>
+    {% for site in sites %}<option value="{{ site.value }}"{% if site.value == selected_site %} selected{% endif %}>{{ site.label }}</option>{% endfor %}
+  </select></label>
+  <label class="v"><span>host</span><select id="device">
+    <option value="">Todos</option>
+    {% for device in device_options %}<option value="{{ device.value }}"{% if device.value == selected_device %} selected{% endif %}>{{ device.label }}</option>{% endfor %}
+  </select></label>
+  <div class="sp"></div>
+  <span><span class="live"></span><span id="st"></span></span>
+  <label class="v"><span>⏱</span><select id="range">
+    <option value="30"{% if selected_range == '30' %} selected{% endif %}>Últimos 30 min</option>
+    <option value="60"{% if selected_range == '60' %} selected{% endif %}>Última 1 hora</option>
+    <option value="180"{% if selected_range == '180' %} selected{% endif %}>Últimas 3 horas</option>
+    <option value="360"{% if selected_range == '360' %} selected{% endif %}>Últimas 6 horas</option>
+  </select></label>
+  <label class="v"><span>↻</span><select id="rf">
+    <option value="0">Off</option><option value="10000" selected>10s</option><option value="30000">30s</option><option value="60000">1m</option>
+  </select></label>
+  <button class="btn" id="go" type="button">Atualizar</button>
+  <button class="btn" id="tv-fullscreen-btn" type="button">Tela Cheia (F11)</button>
+  <a class="btn" href="{% url 'plugins:netbox_monitor:monitor' %}">Voltar ao NetBox</a>
+</header>
+<main id="m"></main>
+<div class="tip" id="tip"></div>
+
+{{ noc_data|json_script:"noc-data" }}
+<script>
+var DATA = JSON.parse(document.getElementById("noc-data").textContent);
+var C={green:"#73bf69",yellow:"#f2cc0c",red:"#f2495c",blue:"#5794f2",orange:"#ff9830",purple:"#b877d9",cyan:"#4fd1c5"};
+var NS="http://www.w3.org/2000/svg",tip=document.getElementById("tip");
+
+function E(t,a,p){var e=document.createElementNS(NS,t);for(var k in a)e.setAttribute(k,a[k]);if(p)p.appendChild(e);return e}
+function esc(v){return String(v==null?"":v).replace(/[&<>"']/g,function(c){return{"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+function fmt(v,d){if(v===null||v===undefined||v===""||isNaN(v))return"N/A";return Number(v).toFixed(d==null?1:d)}
+function fmtValue(v,d,unit){return fmt(v,d)+(v===null||v===undefined||v===""||isNaN(v)?"":" "+(unit||""))}
+function mount(id){var n=document.getElementById(id);n.innerHTML="";return n}
+function emptySvg(svg,W,H,msg){svg.setAttribute("viewBox","0 0 "+W+" "+H);E("text",{x:W/2,y:H/2,"text-anchor":"middle",fill:"#8e8e9e",fontSize:12},svg).textContent=msg}
+function th(v,a,b){return v>=b?C.red:v>=a?C.yellow:C.green}
+
+function pillClass(s){
+  s=String(s||"").toUpperCase();
+  if(s==="ONLINE"||s==="OK"||s==="UP")return"OK";
+  if(s==="OFFLINE"||s==="CRITICAL"||s==="DOWN")return"CRITICAL";
+  if(s==="WARNING"||s==="LOOP / STP")return"WARNING";
+  return"UNKNOWN";
+}
+function pill(s){return'<span class="pill '+pillClass(s)+'">'+esc(s)+'</span>'}
+
+function line(id,labels,series,o){o=o||{};var svg=mount(id),W=svg.clientWidth||500,H=svg.clientHeight||200,m={l:38,r:8,t:6,b:20};
+  if(!labels||!labels.length){emptySvg(svg,W,H,"Sem dados");return}
+  var all=[];series.forEach(function(s){(s.values||[]).forEach(function(v){if(v!==null&&v!==undefined&&!isNaN(v))all.push(+v)})});
+  svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  if(!all.length){emptySvg(svg,W,H,"Sem dados");return}
+  var max=o.max||Math.max.apply(null,all)*1.15||1,n=labels.length;
+  var X=function(i){return m.l+(n<=1?0:(i/(n-1))*(W-m.l-m.r))},Y=function(v){return H-m.b-(v/max)*(H-m.t-m.b)};
+  for(var g=0;g<=4;g++){var y=Y(max/4*g);E("line",{x1:m.l,x2:W-m.r,y1:y,y2:y,stroke:"#2a2d33"},svg);
+    E("text",{x:m.l-5,y:y+4,"text-anchor":"end",fill:"#8e8e9e",fontSize:10.5},svg).textContent=+(max/4*g).toFixed(max<10?1:0)}
+  var seen={};for(var j=0;j<=5;j++){var idx=Math.round((n-1)*j/5);if(seen[idx])continue;seen[idx]=1;
+    E("text",{x:X(idx),y:H-5,"text-anchor":"middle",fill:"#8e8e9e",fontSize:10.5},svg).textContent=labels[idx]}
+  if(o.th){E("line",{x1:m.l,x2:W-m.r,y1:Y(o.th),y2:Y(o.th),stroke:C.red,"stroke-dasharray":"4 4",opacity:.7},svg)}
+  series.forEach(function(s){var vals=s.values||[],d="",started=false,any=false;
+    for(var i=0;i<n;i++){var v=vals[i];if(v===null||v===undefined||isNaN(v)){started=false;continue}
+      d+=(started?"L":"M")+X(i).toFixed(1)+" "+Y(+v).toFixed(1)+" ";started=true;any=true}
+    if(any)E("path",{d:d,fill:"none",stroke:s.color,"stroke-width":1.5,"stroke-linejoin":"round"},svg)});
+  var cur=E("line",{y1:m.t,y2:H-m.b,stroke:"#8e8e9e","stroke-dasharray":"3 3",visibility:"hidden"},svg);
+  var ov=E("rect",{x:m.l,y:m.t,width:W-m.l-m.r,height:H-m.t-m.b,fill:"transparent"},svg);
+  ov.onmousemove=function(e){var r=svg.getBoundingClientRect(),px=(e.clientX-r.left)*W/r.width;
+    var i=n<=1?0:Math.max(0,Math.min(n-1,Math.round((px-m.l)/(W-m.l-m.r)*(n-1)))),x=X(i);
+    cur.setAttribute("x1",x);cur.setAttribute("x2",x);cur.setAttribute("visibility","visible");
+    tip.innerHTML="<b>"+esc(labels[i])+"</b><br>"+series.map(function(s){
+      return'<span style="color:'+s.color+'">●</span> '+esc(s.name)+": <b>"+fmtValue((s.values||[])[i],1,s.unit)+"</b>"}).join("<br>");
+    tip.style.display="block";tip.style.left=Math.min(innerWidth-200,e.clientX+14)+"px";tip.style.top=(e.clientY+14)+"px"};
+  ov.onmouseleave=function(){cur.setAttribute("visibility","hidden");tip.style.display="none"}}
+
+function legend(id,series){document.getElementById(id).innerHTML=series.map(function(s){
+  var vals=s.values||[],last=null;
+  for(var i=vals.length-1;i>=0;i--){if(vals[i]!==null&&vals[i]!==undefined&&!isNaN(vals[i])){last=vals[i];break}}
+  return'<span><i style="background:'+s.color+'"></i>'+esc(s.name)+' <b style="color:#ccc">'+fmtValue(last,1,s.unit)+'</b></span>'}).join("")}
+
+function pol(cx,cy,r,a){a=(a-90)*Math.PI/180;return[cx+r*Math.cos(a),cy+r*Math.sin(a)]}
+function arc(cx,cy,r,a0,a1){var s=pol(cx,cy,r,a0),e=pol(cx,cy,r,a1);return"M"+s[0]+" "+s[1]+" A"+r+" "+r+" 0 "+(a1-a0>180?1:0)+" 1 "+e[0]+" "+e[1]}
+
+function gauge(id,val,o){o=o||{};var svg=mount(id);svg.setAttribute("viewBox","0 0 160 110");
+  E("path",{d:arc(80,62,46,-135,135),fill:"none",stroke:"#22252b","stroke-width":12,"stroke-linecap":"butt"},svg);
+  if(val===null||val===undefined||isNaN(val)){
+    E("text",{x:80,y:68,"text-anchor":"middle",fill:"#8e8e9e",fontSize:20,"font-weight":500},svg).textContent="N/A";
+  }else{
+    var v=Math.max(0,Math.min(100,+val)),c;
+    if(o.invert){c=v<(o.crit||0)?C.red:v<(o.warn||100)?C.yellow:C.green}
+    else{c=v>=(o.crit||90)?C.red:v>=(o.warn||70)?C.yellow:C.green}
+    E("path",{d:arc(80,62,46,-135,-135+270*v/100),fill:"none",stroke:c,"stroke-width":12},svg);
+    E("text",{x:80,y:68,"text-anchor":"middle",fill:c,fontSize:26,"font-weight":500},svg).textContent=Math.round(v)+(o.unit||"%");
+  }
+  E("text",{x:34,y:104,"text-anchor":"middle",fill:"#8e8e9e",fontSize:9},svg).textContent="0";
+  E("text",{x:126,y:104,"text-anchor":"middle",fill:"#8e8e9e",fontSize:9},svg).textContent="100"}
+
+function donut(id,items){var svg=mount(id);svg.setAttribute("viewBox","0 0 260 150");
+  var tot=items.reduce(function(a,i){return a+(i.value||0)},0),R=48,L=2*Math.PI*R,off=0;
+  if(tot>0)items.forEach(function(it){var d=(it.value||0)/tot*L;
+    E("circle",{cx:75,cy:75,r:R,fill:"none",stroke:it.color,"stroke-width":20,"stroke-dasharray":d+" "+(L-d),"stroke-dashoffset":-off,transform:"rotate(-90 75 75)"},svg);off+=d});
+  E("text",{x:75,y:81,"text-anchor":"middle",fill:"#ccc",fontSize:20,"font-weight":500},svg).textContent=tot;
+  items.forEach(function(it,i){E("rect",{x:150,y:28+i*24,width:10,height:10,fill:it.color},svg);
+    E("text",{x:166,y:37+i*24,fill:"#ccc",fontSize:12},svg).textContent=it.label+"  "+(it.value||0)})}
+
+function bars(id,labels,vals,unit){var svg=mount(id),W=svg.clientWidth||400,H=svg.clientHeight||200;
+  if(!labels||!labels.length){emptySvg(svg,W,H,"Sem dados");return}
+  var m={l:30,b:20,t:6},mx=Math.max.apply(null,vals)*1.2||1,bw=(W-m.l-6)/vals.length;
+  svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  for(var g=0;g<=3;g++){var y=H-m.b-(H-m.b-m.t)*g/3;E("line",{x1:m.l,x2:W,y1:y,y2:y,stroke:"#2a2d33"},svg);E("text",{x:m.l-4,y:y+4,"text-anchor":"end",fill:"#8e8e9e",fontSize:10},svg).textContent=Math.round(mx*g/3)}
+  vals.forEach(function(v,i){var h=v/mx*(H-m.b-m.t);var r=E("rect",{x:m.l+i*bw+2,y:H-m.b-h,width:Math.max(1,bw-4),height:h,fill:C.blue,opacity:.9},svg);
+    r.onmousemove=function(e){tip.innerHTML="<b>"+esc(labels[i])+"</b><br>"+v+esc(unit||"");tip.style.display="block";tip.style.left=e.clientX+14+"px";tip.style.top=e.clientY+14+"px"};r.onmouseleave=function(){tip.style.display="none"};
+    if(i%3==0)E("text",{x:m.l+i*bw+bw/2,y:H-5,"text-anchor":"middle",fill:"#8e8e9e",fontSize:10},svg).textContent=labels[i]})}
+
+function bgauge(id,rows){var el=document.getElementById(id);
+  if(!rows||!rows.length){el.innerHTML='<div class="mono" style="padding:4px 0">Sem dados de latência</div>';return}
+  var max=Math.max.apply(null,rows.map(function(r){return r.value}))||1;
+  el.innerHTML=rows.map(function(r){var c=r.value>=150?C.red:r.value>=80?C.yellow:C.green,p=Math.max(2,Math.min(100,r.value/max*100));
+    return'<div><span title="'+esc(r.label)+'">'+esc(r.label)+'</span><div class="bar"><i style="width:'+p+'%;background:'+c+'"></i></div><b style="color:'+c+'">'+fmt(r.value,1)+(r.unit||"")+'</b></div>'}).join("")}
+
+function heat(id,rows,mode){var svg=mount(id),W=svg.clientWidth||600,H=svg.clientHeight||220,m={l:100,t:2,b:2};
+  if(!rows||!rows.length){emptySvg(svg,W,H,"Sem coletas");return}
+  var cols=0;rows.forEach(function(r){cols=Math.max(cols,(r.cells||[]).length)});
+  if(!cols){emptySvg(svg,W,H,"Sem coletas");return}
+  svg.setAttribute("viewBox","0 0 "+W+" "+H);
+  var cw=(W-m.l)/cols,rh=(H-m.t-m.b)/rows.length;
+  rows.forEach(function(row,y){
+    E("text",{x:m.l-6,y:m.t+y*rh+rh/2+4,"text-anchor":"end",fill:"#8e8e9e",fontSize:11},svg).textContent=row.device;
+    for(var x=0;x<cols;x++){var cell=(row.cells||[])[x];if(!cell)continue;
+      var color=cell.online?(cell.latency_ms!=null&&cell.latency_ms>=150?C.orange:C.green):C.red;
+      var q=E("rect",{x:m.l+x*cw+0.5,y:m.t+y*rh+1,width:Math.max(1,cw-1),height:Math.max(1,rh-2),fill:color,opacity:mode==="timeline"?.85:.6,rx:1},svg);
+      q.onmousemove=function(e){tip.innerHTML="<b>"+esc(row.device)+"</b><br>"+esc(this.getAttribute("data-t"))+"<br>"+(this.getAttribute("data-online")==="1"?"ONLINE":"OFFLINE")+"<br>Latência: "+fmtValue(this.getAttribute("data-lat"),1,"ms");tip.style.display="block";tip.style.left=e.clientX+14+"px";tip.style.top=e.clientY+14+"px"};
+      q.onmouseleave=function(){tip.style.display="none"};
+      q.setAttribute("data-t",cell.time);q.setAttribute("data-online",cell.online?"1":"0");q.setAttribute("data-lat",cell.latency_ms==null?"":cell.latency_ms);
+    }
+  })}
+
+function barCell(v){if(v===null||v===undefined||isNaN(v))return'N/A';var c=th(v,70,90);return'<div class="cell"><div class="bar"><i style="width:'+Math.max(0,Math.min(100,v))+'%;background:'+c+'"></i></div>'+fmt(v,1)+'%</div>'}
+function emptyRow(cols,msg){return'<tr><td colspan="'+cols+'" class="mono">'+esc(msg)+'</td></tr>'}
+
+function renderDevices(rows){var el=document.getElementById("pdev");
+  var head='<tr><th>Host</th><th>IP</th><th>Status</th><th>CPU</th><th>Memória</th><th>Latência</th><th>Tráfego (Mbps)</th><th>Portas</th><th>Uptime</th><th>SLA</th></tr>';
+  if(!rows.length){el.innerHTML=head+emptyRow(10,"Nenhum dispositivo monitorado para o filtro selecionado.");return}
+  el.innerHTML=head+rows.map(function(r){
+    var net=(r.download_mbps==null&&r.upload_mbps==null)?"N/A":"↓ "+fmt(r.download_mbps,2)+" / ↑ "+fmt(r.upload_mbps,2);
+    var ports=r.total_ports?r.active_ports+" / "+r.total_ports:"N/A";
+    var sla=r.sla_percent==null?"N/A":fmt(r.sla_percent,2)+"%";
+    return"<tr><td>"+esc(r.name)+"</td><td class='mono'>"+esc(r.ip)+"</td><td>"+pill(r.status)+"</td><td>"+barCell(r.cpu)+"</td><td>"+barCell(r.memory)+"</td><td class='mono'>"+(r.latency_ms==null?"N/A":fmt(r.latency_ms,1)+" ms")+"</td><td class='mono'>"+net+"</td><td>"+ports+"</td><td class='mono'>"+esc(r.uptime||"N/A")+"</td><td>"+sla+"</td></tr>";
+  }).join("")}
+
+function renderTop(rows){var el=document.getElementById("ptop");
+  var head='<tr><th>Host</th><th>CPU</th><th>Memória</th><th>Tráfego (Mbps)</th></tr>';
+  if(!rows.length){el.innerHTML=head+emptyRow(4,"Sem dados de CPU, memória ou tráfego.");return}
+  el.innerHTML=head+rows.map(function(r){
+    return"<tr><td>"+esc(r.name)+"</td><td>"+barCell(r.cpu)+"</td><td>"+barCell(r.memory)+"</td><td class='mono'>"+(r.traffic_total==null?"N/A":fmt(r.traffic_total,2))+"</td></tr>";
+  }).join("")}
+
+function renderLog(rows){var el=document.getElementById("plog");
+  var head='<tr><th>Hora</th><th>Status</th><th>Host</th><th>Evento</th><th>Descrição</th></tr>';
+  if(!rows.length){el.innerHTML=head+emptyRow(5,"Nenhum incidente nas últimas 24 horas.");return}
+  el.innerHTML=head+rows.map(function(r){
+    return"<tr><td class='mono'>"+esc(r.timestamp)+"</td><td>"+pill(r.status)+"</td><td>"+esc(r.device)+"</td><td>"+esc(r.status)+"</td><td>"+esc(r.description)+"</td></tr>";
+  }).join("")}
+
+/* ================= LAYOUT ================= */
+var LAY=[
+ ["Visão geral","status em tempo real",[
+  ["s2 h1","Hosts UP","stat","up"],["s2 h1","Hosts DOWN","stat","down"],["s2 h1","Sem dados","stat","nd"],["s2 h1","SLA médio (7d)","stat","sla"],["s2 h1","Alertas STP","stat","stp"],["s2 h1","Tráfego total","stat","trf"],
+  ["s3 h2","CPU médio","gauge","g1"],["s3 h2","Memória média","gauge","g2"],["s3 h2","Portas UP","gauge","g3"],["s3 h2","SLA médio","gauge","g4"],
+  ["s4 h2","Distribuição de status","donut","dn"],["s4 h2","Latência por dispositivo (ms)","bgauge","latb"],["s4 h2","Incidentes por hora (24h)","bars","ah"]]],
+ ["Servidores","CPU · memória · disponibilidade",[
+  ["s6 h2","CPU (%) — média","line","cpu"],["s6 h2","Memória (%) — média","line","mem"],
+  ["s6 h3","Mapa de calor — disponibilidade por coleta","heat","hm"],["s6 h3","Linha do tempo de estado","tl","tl"]]],
+ ["Rede","tráfego · latência",[
+  ["s8 h2","Tráfego (Mbps)","line","net"],["s4 h2","Latência média (ms)","line","ping"]]],
+ ["Alertas","dispositivos · incidentes",[
+  ["s12 h3","Dispositivos monitorados","tbl","dev"],["s6 h3","Top dispositivos","tbl","top"],["s6 h3","Log de incidentes (24h)","tbl","log"]]]
+];
+var m=document.getElementById("m"),html="";
+LAY.forEach(function(r,ri){html+='<div class="row" data-r="'+ri+'"><span class="ar">▾</span>'+r[0]+' <b>'+r[1]+'</b></div>';
+  r[2].forEach(function(p){var id="p"+p[3];html+='<section class="p '+p[0]+' r'+ri+'"><h2>'+p[1]+'<em></em></h2><div class="b">'+
+   (p[2]=="stat"?'<div class="stat"><svg id="sp'+p[3]+'"></svg><div class="v1" id="'+id+'"></div><div class="l">'+p[1]+'</div></div>':
+    p[2]=="gauge"||p[2]=="donut"||p[2]=="bars"||p[2]=="heat"||p[2]=="tl"?'<svg id="'+id+'"></svg>':
+    p[2]=="line"?'<svg style="height:calc(100% - 22px)" id="'+id+'"></svg><div class="leg" id="l'+p[3]+'"></div>':
+    p[2]=="bgauge"?'<div class="bg" id="'+id+'"></div>':'<div class="sc"><table id="'+id+'"></table></div>')+'</div></section>'})});
+m.innerHTML=html;
+
+/* ================= RENDER ================= */
+function stat(id,value,color){var el=document.getElementById("p"+id);if(!el)return;el.textContent=value;el.style.color=color}
+
+function render(){
+  var d=DATA,s=d.summary,g=d.gauges,t=d.trend;
+  stat("up",s.online,C.green);
+  stat("down",s.offline,s.offline?C.red:C.green);
+  stat("nd",s.no_data,s.no_data?C.yellow:C.green);
+  stat("sla",s.sla==null?"N/A":fmt(s.sla,2)+"%",C.green);
+  stat("stp",s.stp_alerts,s.stp_alerts?C.red:C.green);
+  stat("trf",s.traffic_total==null?"N/A":fmt(s.traffic_total,1)+" Mbps",C.blue);
+
+  gauge("pg1",g.cpu,{warn:70,crit:90,unit:"%"});
+  gauge("pg2",g.memory,{warn:70,crit:90,unit:"%"});
+  gauge("pg3",g.ports,{warn:90,crit:50,invert:true,unit:"%"});
+  gauge("pg4",g.sla,{warn:99,crit:95,invert:true,unit:"%"});
+
+  donut("pdn",d.status_donut);
+  bgauge("platb",d.latency_bars);
+  bars("pah",d.alerts_hour.labels,d.alerts_hour.values," incidentes");
+
+  var cpuSeries=[{name:"CPU média",color:C.green,unit:"%",values:t.cpu}];
+  var memSeries=[{name:"Memória média",color:C.purple,unit:"%",values:t.memory}];
+  line("pcpu",t.labels,cpuSeries,{max:100,th:90});legend("lcpu",cpuSeries);
+  line("pmem",t.labels,memSeries,{max:100});legend("lmem",memSeries);
+
+  heat("phm",d.availability,"heat");
+  heat("ptl",d.availability,"timeline");
+
+  var netSeries=[{name:"download",color:C.green,unit:"Mbps",values:t.download},{name:"upload",color:C.yellow,unit:"Mbps",values:t.upload}];
+  var pingSeries=[{name:"latência média",color:C.blue,unit:"ms",values:t.latency}];
+  line("pnet",t.labels,netSeries);legend("lnet",netSeries);
+  line("pping",t.labels,pingSeries);legend("lping",pingSeries);
+
+  renderDevices(d.devices);
+  renderTop(d.top_devices);
+  renderLog(d.incidents);
+
+  document.getElementById("st").textContent="Atualizado "+d.generated_at;
+}
+
+/* ================= FILTROS E ATUALIZAÇÃO ================= */
+function navigate(params){
+  var url=new URL(window.location.href);
+  Object.keys(params).forEach(function(key){
+    if(params[key]===null||params[key]==="")url.searchParams.delete(key);
+    else url.searchParams.set(key,params[key]);
+  });
+  window.location.href=url.toString();
+}
+document.getElementById("site").onchange=function(){navigate({site:this.value,device:""})};
+document.getElementById("device").onchange=function(){navigate({device:this.value})};
+document.getElementById("range").onchange=function(){navigate({range:this.value})};
+document.getElementById("go").onclick=function(){window.location.reload()};
+
+var rf=document.getElementById("rf"),timer=null;
+try{var saved=sessionStorage.getItem("noc-refresh");if(saved!==null)rf.value=saved}catch(e){}
+function sched(){
+  clearTimeout(timer);
+  var v=+rf.value;
+  if(v>0)timer=setTimeout(function(){window.location.reload()},v);
+}
+rf.onchange=function(){try{sessionStorage.setItem("noc-refresh",rf.value)}catch(e){}sched()};
+
+var fullscreenBtn=document.getElementById("tv-fullscreen-btn");
+function tvIsFS(){return Boolean(document.fullscreenElement||document.webkitFullscreenElement||document.msFullscreenElement)}
+fullscreenBtn.onclick=function(){if(tvIsFS()){document.exitFullscreen();}else{document.documentElement.requestFullscreen();}};
+document.addEventListener("fullscreenchange",function(){fullscreenBtn.textContent=tvIsFS()?"Sair da Tela Cheia (F11)":"Tela Cheia (F11)"});
+
+addEventListener("resize",render);render();sched();
+</script>
+</body>
+</html>

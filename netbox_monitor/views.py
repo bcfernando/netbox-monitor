@@ -597,7 +597,7 @@ def _monitored_devices(request):
     return list(
         Device.objects.restrict(request.user, 'view')
         .filter(Q(primary_ip4__isnull=False) | Q(primary_ip6__isnull=False))
-        .select_related('primary_ip4', 'primary_ip6')
+        .select_related('primary_ip4', 'primary_ip6', 'site')
         .order_by('name')
     )
 
@@ -643,20 +643,63 @@ def _build_noc_rows(devices):
         if stats and stats['total']:
             sla_percent = round(stats['online'] / stats['total'] * 100, 2)
 
+        poe = _poe_summary(
+            metric.hardware_metrics if metric is not None else None
+        )
+        poe_used = poe['used_watts'] if poe else None
+        poe_budget = poe['budget_watts'] if poe else None
+
+        traffic_download_mbps = 0.0
+        traffic_upload_mbps = 0.0
+        has_traffic = False
+        for interface_row in interface_rows:
+            traffic_download = interface_row.get('download_mbps')
+            traffic_upload = interface_row.get('upload_mbps')
+            if traffic_download is not None:
+                traffic_download_mbps += float(traffic_download)
+                has_traffic = True
+            if traffic_upload is not None:
+                traffic_upload_mbps += float(traffic_upload)
+                has_traffic = True
+        device_download_mbps = (
+            round(traffic_download_mbps, 3) if has_traffic else None
+        )
+        device_upload_mbps = round(traffic_upload_mbps, 3) if has_traffic else None
+
+        port_percent = None
+        if physical_rows:
+            port_percent = round(
+                sum(
+                    1 for row in physical_rows
+                    if (row.get('status') or '').upper() == 'UP'
+                ) / len(physical_rows) * 100,
+                1,
+            )
+
+        loop_alert = _loop_flag(metric)
+
         rows.append({
             'device': device,
             'ip': str(device.primary_ip.address).split('/')[0] if device.primary_ip else '',
             'metric': metric,
+            'status': 'ONLINE' if (metric and metric.is_online) else 'OFFLINE',
             'is_online': bool(metric and metric.is_online),
             'has_latency': bool(metric and metric.latency_ms is not None),
+            'latency_ms': metric.latency_ms if metric else None,
             'uptime': _format_uptime(metric),
             'active_ports': sum(
                 1 for row in physical_rows
                 if (row.get('status') or '').upper() == 'UP'
             ),
             'total_ports': len(physical_rows),
+            'port_percent': port_percent,
             'traffic_total': _aggregate_traffic(interface_rows),
-            'stp_alert': _loop_flag(metric),
+            'download_mbps': device_download_mbps,
+            'upload_mbps': device_upload_mbps,
+            'loop_alert': loop_alert,
+            'stp_alert': loop_alert,
+            'poe_used': poe_used,
+            'poe_budget': poe_budget,
             'sla_percent': sla_percent,
             'sla_badge_class': _sla_badge_class(sla_percent),
         })
@@ -1105,3 +1148,340 @@ class CollectAllView(View):
             _('Coleta de todos os dispositivos enfileirada (Job #{id}).').format(id=job.pk),
         )
         return redirect(reverse('plugins:netbox_monitor:monitor'))
+
+
+_TV_RANGE_OPTIONS = (30, 60, 180, 360)
+
+
+def _tv_range_minutes(request):
+    try:
+        value = int(request.GET.get('range', '60'))
+    except (TypeError, ValueError):
+        return 60
+    return value if value in _TV_RANGE_OPTIONS else 60
+
+
+def _tv_avg(values):
+    numbers = [float(value) for value in values if value is not None]
+    if not numbers:
+        return None
+    return round(sum(numbers) / len(numbers), 1)
+
+
+def _tv_site_options(devices):
+    sites = {}
+    for device in devices:
+        site = getattr(device, 'site', None)
+        if site is not None:
+            sites[site.slug] = site.name
+    return [
+        {'value': slug, 'label': name}
+        for slug, name in sorted(sites.items(), key=lambda item: item[1].lower())
+    ]
+
+
+def _tv_device_options(devices):
+    return [
+        {
+            'value': str(device.pk),
+            'label': str(device.name),
+            'site': device.site.slug if getattr(device, 'site', None) else '',
+        }
+        for device in devices
+    ]
+
+
+def _tv_filter_devices(devices, site, device_id):
+    filtered = devices
+    if site:
+        filtered = [
+            device for device in filtered
+            if getattr(device, 'site', None) is not None
+            and device.site.slug == site
+        ]
+    if device_id.isdigit():
+        filtered = [
+            device for device in filtered if device.pk == int(device_id)
+        ]
+    return filtered
+
+
+def _tv_trend_series(devices, minutes):
+    now = timezone.now()
+    start = now - timedelta(minutes=minutes)
+    metrics = (
+        DeviceMetric.objects.filter(device__in=devices, timestamp__gte=start)
+        .order_by('device_id', 'timestamp')
+    )
+    prior_metrics = (
+        DeviceMetric.objects.filter(device__in=devices, timestamp__lt=start)
+        .order_by('device_id', '-timestamp')
+        .distinct('device_id')
+    )
+    last_by_device = {metric.device_id: metric for metric in prior_metrics}
+
+    buckets = {}
+    for metric in metrics:
+        interface_rows = _interfaces_with_rates(
+            metric, last_by_device.get(metric.device_id)
+        )
+        last_by_device[metric.device_id] = metric
+        minute = metric.timestamp.replace(second=0, microsecond=0)
+        bucket = buckets.setdefault(
+            minute,
+            {
+                'download': 0.0,
+                'upload': 0.0,
+                'has_traffic': False,
+                'cpu': [],
+                'memory': [],
+                'latency': [],
+            },
+        )
+        for interface in interface_rows:
+            download = interface.get('download_mbps')
+            upload = interface.get('upload_mbps')
+            if download is not None:
+                bucket['download'] += float(download)
+                bucket['has_traffic'] = True
+            if upload is not None:
+                bucket['upload'] += float(upload)
+                bucket['has_traffic'] = True
+        if metric.cpu_percent is not None:
+            bucket['cpu'].append(float(metric.cpu_percent))
+        if metric.memory_percent is not None:
+            bucket['memory'].append(float(metric.memory_percent))
+        if metric.latency_ms is not None:
+            bucket['latency'].append(float(metric.latency_ms))
+
+    points = _downsample(sorted(buckets.items()), _MAX_CHART_POINTS)
+    return {
+        'labels': [point[0].strftime('%H:%M') for point in points],
+        'download': [
+            round(point[1]['download'], 2) if point[1]['has_traffic'] else None
+            for point in points
+        ],
+        'upload': [
+            round(point[1]['upload'], 2) if point[1]['has_traffic'] else None
+            for point in points
+        ],
+        'cpu': [_tv_avg(point[1]['cpu']) for point in points],
+        'memory': [_tv_avg(point[1]['memory']) for point in points],
+        'latency': [_tv_avg(point[1]['latency']) for point in points],
+    }
+
+
+def _tv_availability(devices, limit=36):
+    rows = []
+    for device in devices:
+        metrics = list(
+            DeviceMetric.objects.filter(device=device).order_by('-timestamp')[:limit]
+        )
+        metrics.reverse()
+        rows.append({
+            'device': str(device.name),
+            'cells': [
+                {
+                    'time': metric.timestamp.strftime('%H:%M:%S'),
+                    'timestamp': metric.timestamp.isoformat(),
+                    'online': bool(metric.is_online),
+                    'latency_ms': metric.latency_ms,
+                }
+                for metric in metrics
+            ],
+        })
+    return rows
+
+
+def _tv_device_rows(rows):
+    devices = []
+    for row in rows:
+        metric = row['metric']
+        devices.append({
+            'name': str(row['device'].name),
+            'ip': row['ip'] or 'N/A',
+            'status': (
+                'ONLINE' if row['is_online']
+                else 'OFFLINE' if metric is not None
+                else 'NO DATA'
+            ),
+            'cpu': (
+                round(float(metric.cpu_percent), 1)
+                if metric is not None and metric.cpu_percent is not None
+                else None
+            ),
+            'memory': (
+                round(float(metric.memory_percent), 1)
+                if metric is not None and metric.memory_percent is not None
+                else None
+            ),
+            'latency_ms': (
+                round(float(metric.latency_ms), 1)
+                if metric is not None and metric.latency_ms is not None
+                else None
+            ),
+            'download_mbps': row['download_mbps'],
+            'upload_mbps': row['upload_mbps'],
+            'traffic_total': row['traffic_total'],
+            'active_ports': row['active_ports'],
+            'total_ports': row['total_ports'],
+            'port_percent': row['port_percent'],
+            'uptime': (
+                row['uptime']
+                if metric is not None and row['uptime'] != '-'
+                else None
+            ),
+            'sla_percent': row['sla_percent'],
+            'stp_alert': row['stp_alert'],
+            'has_metric': metric is not None,
+        })
+    return devices
+
+
+def _tv_incident_payload(events):
+    return [
+        {
+            'timestamp': event['timestamp'].strftime('%d/%m %H:%M:%S'),
+            'iso': event['timestamp'].isoformat(),
+            'status': event['event_type'],
+            'device': str(event['device']),
+            'description': event['description'],
+        }
+        for event in events
+    ]
+
+
+def _tv_alerts_by_hour(events, now):
+    hour_start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
+    hours = [hour_start + timedelta(hours=index) for index in range(24)]
+    counts = [0] * 24
+    for event in events:
+        offset = int((event['timestamp'] - hour_start).total_seconds() // 3600)
+        if 0 <= offset < 24:
+            counts[offset] += 1
+    return {
+        'labels': [hour.strftime('%H:00') for hour in hours],
+        'values': counts,
+    }
+
+
+class NocTvDashboardView(LoginRequiredMixin, View):
+    def get(self, request):
+        plugin_config = apps.get_app_config('netbox_monitor')
+        all_devices = _monitored_devices(request)
+
+        site = (request.GET.get('site') or '').strip()
+        device_id = (request.GET.get('device') or '').strip()
+        minutes = _tv_range_minutes(request)
+
+        site_options = _tv_site_options(all_devices)
+        scoped_devices = _tv_filter_devices(all_devices, site, '')
+        device_options = _tv_device_options(scoped_devices)
+        devices = _tv_filter_devices(all_devices, site, device_id)
+
+        rows = _build_noc_rows(devices)
+        device_rows = _tv_device_rows(rows)
+
+        online_devices = sum(1 for row in rows if row['is_online'])
+        offline_devices = sum(
+            1 for row in rows if row['metric'] is not None and not row['is_online']
+        )
+        no_data_devices = sum(1 for row in rows if row['metric'] is None)
+
+        total_traffic = sum(
+            row['traffic_total'] for row in rows
+            if row['traffic_total'] is not None
+        )
+
+        avg_cpu = _tv_avg([row['cpu'] for row in device_rows])
+        avg_memory = _tv_avg([row['memory'] for row in device_rows])
+        avg_ports = _tv_avg([row['port_percent'] for row in device_rows])
+        avg_sla = _tv_avg([row['sla_percent'] for row in device_rows])
+        stp_alerts = sum(1 for row in rows if row['stp_alert'])
+
+        now = timezone.now()
+        events = _build_recent_incidents(
+            devices,
+            now - _INCIDENT_WINDOW,
+            limit=500,
+        )
+
+        trend = _tv_trend_series(devices, minutes)
+        availability = _tv_availability(devices)
+
+        latency_bars = sorted(
+            [
+                {
+                    'label': row['name'],
+                    'value': row['latency_ms'],
+                    'unit': ' ms',
+                }
+                for row in device_rows
+                if row['latency_ms'] is not None
+            ],
+            key=lambda item: item['value'],
+            reverse=True,
+        )[:8]
+
+        top_devices = sorted(
+            [row for row in device_rows if row['has_metric']],
+            key=lambda row: (
+                row['cpu'] if row['cpu'] is not None else -1,
+                row['memory'] if row['memory'] is not None else -1,
+                row['traffic_total'] if row['traffic_total'] is not None else -1,
+            ),
+            reverse=True,
+        )[:8]
+
+        noc_data = {
+            'generated_at': timezone.localtime(now).strftime('%d/%m/%Y %H:%M:%S'),
+            'filters': {
+                'site': site,
+                'device': device_id,
+                'range': str(minutes),
+            },
+            'sites': site_options,
+            'device_options': device_options,
+            'summary': {
+                'total': len(rows),
+                'online': online_devices,
+                'offline': offline_devices,
+                'no_data': no_data_devices,
+                'sla': avg_sla,
+                'stp_alerts': stp_alerts,
+                'traffic_total': round(total_traffic, 2),
+            },
+            'gauges': {
+                'cpu': avg_cpu,
+                'memory': avg_memory,
+                'ports': avg_ports,
+                'sla': avg_sla,
+            },
+            'status_donut': [
+                {'label': 'Online', 'value': online_devices, 'color': '#73bf69'},
+                {'label': 'Offline', 'value': offline_devices, 'color': '#f2495c'},
+                {'label': 'Sem dados', 'value': no_data_devices, 'color': '#5794f2'},
+            ],
+            'trend': trend,
+            'availability': availability,
+            'latency_bars': latency_bars,
+            'devices': device_rows,
+            'top_devices': top_devices,
+            'alerts_hour': _tv_alerts_by_hour(events, now),
+            'incidents': _tv_incident_payload(events[:50]),
+        }
+
+        return render(
+            request,
+            'netbox_monitor/noc_tv.html',
+            {
+                'plugin_name': plugin_config.verbose_name,
+                'plugin_version': plugin_config.version,
+                'sites': site_options,
+                'device_options': device_options,
+                'selected_site': site,
+                'selected_device': device_id,
+                'selected_range': str(minutes),
+                'noc_data': noc_data,
+            },
+        )

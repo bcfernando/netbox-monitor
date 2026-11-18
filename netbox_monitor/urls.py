@@ -9,4 +9,5 @@ urlpatterns = [
     path('export/csv/', views.ExportNocCsvView.as_view(), name='export_csv'),
     path('devices/<int:pk>/collect/', views.CollectNowView.as_view(), name='device_collect'),
     path('device/<int:pk>/sync/', views.SyncSnmpToNetboxView.as_view(), name='device_sync'),
+    path('tv/', views.NocTvDashboardView.as_view(), name='tv'),
 ]
