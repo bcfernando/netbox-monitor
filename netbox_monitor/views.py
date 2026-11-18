@@ -1183,19 +1183,30 @@ class SyncSnmpToNetboxView(LoginRequiredMixin, View):
 
 class CollectAllView(LoginRequiredMixin, View):
     def post(self, request, *args, **kwargs):
-        import threading
+        import threading, traceback
         from django.db import close_old_connections
         from dcim.models import Device
         from .jobs import collect_snmp
 
         def _bg_worker():
             try:
-                [ collect_snmp(d) for d in (Device.objects.filter(primary_ip4__isnull=False) | Device.objects.filter(primary_ip6__isnull=False)).distinct() ]
+                from .models import MonitorSettings
+                cfg = MonitorSettings.objects.first()
+                default_comm = getattr(cfg, 'default_snmp_community', 'public') or 'public'
+                devs = (Device.objects.filter(primary_ip4__isnull=False) | Device.objects.filter(primary_ip6__isnull=False)).distinct()
+                print(f'[NetBox Monitor] Coletando {devs.count()} dispositivos...', flush=True)
+                for d in devs:
+                    ip = str(d.primary_ip.address.ip)
+                    comm = (d.custom_field_data or {}).get('snmp_community') or default_comm
+                    collect_snmp(ip, comm)
+                print('[NetBox Monitor] Coleta em lote concluida!', flush=True)
+            except Exception:
+                traceback.print_exc()
             finally:
                 close_old_connections()
 
         threading.Thread(target=_bg_worker, daemon=True).start()
-        messages.success(request, 'Coleta em lote iniciada em segundo plano! Atualize a pagina em alguns segundos.')
+        messages.success(request, 'Coleta em lote iniciada em segundo plano! Aguarde ~15 segundos e atualize a pagina.')
         return redirect('login')
 
 class NocTvDashboardView(LoginRequiredMixin, View):
