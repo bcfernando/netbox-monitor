@@ -1181,236 +1181,27 @@ class SyncSnmpToNetboxView(LoginRequiredMixin, View):
         return redirect(redirect_url)
 
 
-class CollectAllView(View):
-    def post(self, request):
-        if not request.user.is_authenticated:
-            return redirect('login')
+class CollectAllView(LoginRequiredMixin, View):
+    def post(self, request, *args, **kwargs):
+        import threading
+        from django.db import close_old_connections
+        from .jobs import collect_all_devices
 
-        job = DeviceMonitorJob.enqueue(
-            user=request.user,
-            name='Monitor all devices',
-        )
-        messages.success(
-            request,
-            _('Coleta de todos os dispositivos enfileirada (Job #{id}).').format(id=job.pk),
-        )
-        return redirect(reverse('plugins:netbox_monitor:monitor'))
+        def _bg_worker():
+            try:
+                collect_all_devices()
+            finally:
+                close_old_connections()
 
+        try:
+            import django_rq
+            queue = django_rq.get_queue('default')
+            queue.enqueue(collect_all_devices)
+        except Exception:
+            threading.Thread(target=_bg_worker, daemon=True).start()
 
-_TV_RANGE_OPTIONS = (30, 60, 180, 360)
-
-
-def _tv_range_minutes(request):
-    try:
-        value = int(request.GET.get('range', '60'))
-    except (TypeError, ValueError):
-        return 60
-    return value if value in _TV_RANGE_OPTIONS else 60
-
-
-def _tv_avg(values):
-    numbers = [float(value) for value in values if value is not None]
-    if not numbers:
-        return None
-    return round(sum(numbers) / len(numbers), 1)
-
-
-def _tv_site_options(devices):
-    sites = {}
-    for device in devices:
-        site = getattr(device, 'site', None)
-        if site is not None:
-            sites[site.slug] = site.name
-    return [
-        {'value': slug, 'label': name}
-        for slug, name in sorted(sites.items(), key=lambda item: item[1].lower())
-    ]
-
-
-def _tv_device_options(devices):
-    return [
-        {
-            'value': str(device.pk),
-            'label': str(device.name),
-            'site': device.site.slug if getattr(device, 'site', None) else '',
-        }
-        for device in devices
-    ]
-
-
-def _tv_filter_devices(devices, site, device_id):
-    filtered = devices
-    if site:
-        filtered = [
-            device for device in filtered
-            if getattr(device, 'site', None) is not None
-            and device.site.slug == site
-        ]
-    if device_id.isdigit():
-        filtered = [
-            device for device in filtered if device.pk == int(device_id)
-        ]
-    return filtered
-
-
-def _tv_trend_series(devices, minutes):
-    now = timezone.now()
-    start = now - timedelta(minutes=minutes)
-    metrics = (
-        DeviceMetric.objects.filter(device__in=devices, timestamp__gte=start)
-        .order_by('device_id', 'timestamp')
-    )
-    prior_metrics = (
-        DeviceMetric.objects.filter(device__in=devices, timestamp__lt=start)
-        .order_by('device_id', '-timestamp')
-        .distinct('device_id')
-    )
-    last_by_device = {metric.device_id: metric for metric in prior_metrics}
-
-    buckets = {}
-    for metric in metrics:
-        interface_rows = _interfaces_with_rates(
-            metric, last_by_device.get(metric.device_id)
-        )
-        last_by_device[metric.device_id] = metric
-        minute = metric.timestamp.replace(second=0, microsecond=0)
-        bucket = buckets.setdefault(
-            minute,
-            {
-                'download': 0.0,
-                'upload': 0.0,
-                'has_traffic': False,
-                'cpu': [],
-                'memory': [],
-                'latency': [],
-            },
-        )
-        for interface in interface_rows:
-            download = interface.get('download_mbps')
-            upload = interface.get('upload_mbps')
-            if download is not None:
-                bucket['download'] += float(download)
-                bucket['has_traffic'] = True
-            if upload is not None:
-                bucket['upload'] += float(upload)
-                bucket['has_traffic'] = True
-        if metric.cpu_percent is not None:
-            bucket['cpu'].append(float(metric.cpu_percent))
-        if metric.memory_percent is not None:
-            bucket['memory'].append(float(metric.memory_percent))
-        if metric.latency_ms is not None:
-            bucket['latency'].append(float(metric.latency_ms))
-
-    points = _downsample(sorted(buckets.items()), _MAX_CHART_POINTS)
-    return {
-        'labels': [point[0].strftime('%H:%M') for point in points],
-        'download': [
-            round(point[1]['download'], 2) if point[1]['has_traffic'] else None
-            for point in points
-        ],
-        'upload': [
-            round(point[1]['upload'], 2) if point[1]['has_traffic'] else None
-            for point in points
-        ],
-        'cpu': [_tv_avg(point[1]['cpu']) for point in points],
-        'memory': [_tv_avg(point[1]['memory']) for point in points],
-        'latency': [_tv_avg(point[1]['latency']) for point in points],
-    }
-
-
-def _tv_availability(devices, limit=36):
-    rows = []
-    for device in devices:
-        metrics = list(
-            DeviceMetric.objects.filter(device=device).order_by('-timestamp')[:limit]
-        )
-        metrics.reverse()
-        rows.append({
-            'device': str(device.name),
-            'cells': [
-                {
-                    'time': metric.timestamp.strftime('%H:%M:%S'),
-                    'timestamp': metric.timestamp.isoformat(),
-                    'online': bool(metric.is_online),
-                    'latency_ms': metric.latency_ms,
-                }
-                for metric in metrics
-            ],
-        })
-    return rows
-
-
-def _tv_device_rows(rows):
-    devices = []
-    for row in rows:
-        metric = row['metric']
-        devices.append({
-            'name': str(row['device'].name),
-            'ip': row['ip'] or 'N/A',
-            'status': (
-                'ONLINE' if row['is_online']
-                else 'OFFLINE' if metric is not None
-                else 'NO DATA'
-            ),
-            'cpu': (
-                round(float(metric.cpu_percent), 1)
-                if metric is not None and metric.cpu_percent is not None
-                else None
-            ),
-            'memory': (
-                round(float(metric.memory_percent), 1)
-                if metric is not None and metric.memory_percent is not None
-                else None
-            ),
-            'latency_ms': (
-                round(float(metric.latency_ms), 1)
-                if metric is not None and metric.latency_ms is not None
-                else None
-            ),
-            'download_mbps': row['download_mbps'],
-            'upload_mbps': row['upload_mbps'],
-            'traffic_total': row['traffic_total'],
-            'active_ports': row['active_ports'],
-            'total_ports': row['total_ports'],
-            'port_percent': row['port_percent'],
-            'uptime': (
-                row['uptime']
-                if metric is not None and row['uptime'] != '-'
-                else None
-            ),
-            'sla_percent': row['sla_percent'],
-            'stp_alert': row['stp_alert'],
-            'has_metric': metric is not None,
-        })
-    return devices
-
-
-def _tv_incident_payload(events):
-    return [
-        {
-            'timestamp': event['timestamp'].strftime('%d/%m %H:%M:%S'),
-            'iso': event['timestamp'].isoformat(),
-            'status': event['event_type'],
-            'device': str(event['device']),
-            'description': event['description'],
-        }
-        for event in events
-    ]
-
-
-def _tv_alerts_by_hour(events, now):
-    hour_start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
-    hours = [hour_start + timedelta(hours=index) for index in range(24)]
-    counts = [0] * 24
-    for event in events:
-        offset = int((event['timestamp'] - hour_start).total_seconds() // 3600)
-        if 0 <= offset < 24:
-            counts[offset] += 1
-    return {
-        'labels': [hour.strftime('%H:00') for hour in hours],
-        'values': counts,
-    }
-
+        messages.success(request, 'Coleta em lote iniciada em segundo plano! Atualize a pagina em alguns segundos.')
+        return redirect('login')
 
 class NocTvDashboardView(LoginRequiredMixin, View):
     def get(self, request):
