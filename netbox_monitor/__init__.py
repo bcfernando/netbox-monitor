@@ -17,7 +17,9 @@ class NetBoxMonitorConfig(PluginConfig):
         super().ready()
         from importlib import import_module
 
-        import_module('netbox_monitor.jobs')
+        jobs = import_module('netbox_monitor.jobs')
+        if jobs.should_start_fast_ping_daemon():
+            jobs.start_fast_ping_daemon()
 
 
 config = NetBoxMonitorConfig

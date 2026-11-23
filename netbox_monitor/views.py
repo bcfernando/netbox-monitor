@@ -24,7 +24,13 @@ from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
 
 from .forms import MonitorSettingsForm
-from .jobs import DeviceMonitorJob, collect_device, save_metric, send_webhook_alert
+from .jobs import (
+    DeviceMonitorJob,
+    collect_device,
+    save_metric,
+    send_webhook_alert,
+    start_fast_ping_daemon,
+)
 from .models import DeviceMetric, MonitorSettings
 
 _VIRTUAL_INTERFACE_RE = re.compile(
@@ -1447,6 +1453,7 @@ def _tv_alerts_by_hour(events, now):
 
 class NocTvDashboardView(LoginRequiredMixin, View):
     def get(self, request):
+        start_fast_ping_daemon()
         plugin_config = apps.get_app_config('netbox_monitor')
         all_devices = _monitored_devices(request)
 
@@ -1569,6 +1576,7 @@ class NocTvDashboardView(LoginRequiredMixin, View):
 
 class LiveMetricsApiView(LoginRequiredMixin, View):
     def get(self, request):
+        start_fast_ping_daemon()
         devices = _monitored_devices(request)
         rows = _build_noc_rows(devices)
 
@@ -1642,6 +1650,8 @@ class LiveMetricsApiView(LoginRequiredMixin, View):
                     metric.memory_percent if metric is not None else None
                 ),
                 'sla_percent': row['sla_percent'],
+                'stp_alert': row['stp_alert'],
+                'loop_alert': row['loop_alert'],
                 'poe_used_watts': row['poe_used'],
                 'last_seen': (
                     timezone.localtime(metric.timestamp).strftime('%H:%M:%S')

@@ -20,6 +20,13 @@ html,body{margin:0;background:var(--bg);color:var(--text);font:12.5px/1.4 Inter,
 .btn{background:var(--head);color:var(--text);border:1px solid var(--border);border-radius:2px;padding:4px 10px;font:inherit;cursor:pointer;text-decoration:none}
 .btn:hover{border-color:var(--blue)}
 .btn:focus-visible,select:focus-visible{outline:2px solid var(--blue)}
+.btn.on{border-color:var(--red);color:#ffd7dc;background:#2a1418}
+.noc-alert{position:fixed;top:54px;left:50%;transform:translateX(-50%);z-index:30;display:none;max-width:90vw;padding:8px 16px;border:2px solid var(--red);border-radius:4px;background:#1b0e11f2;color:#ffd7dc;font-weight:600;letter-spacing:.2px;box-shadow:0 0 18px #f2495c88;animation:alertPulse 1.1s ease-in-out infinite}
+.noc-alert.on{display:block}
+@keyframes alertPulse{0%,100%{border-color:#f2495c55;box-shadow:0 0 6px #f2495c44}50%{border-color:var(--red);box-shadow:0 0 24px #f2495caa}}
+tr.alert-row td{animation:rowPulse 1.1s ease-in-out infinite}
+@keyframes rowPulse{0%,100%{background:#f2495c14}50%{background:#f2495c59}}
+@media(prefers-reduced-motion:reduce){.noc-alert,tr.alert-row td{animation:none}}
 .live{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-right:6px;animation:p 2s infinite}
 @keyframes p{50%{opacity:.35}}
 @media(prefers-reduced-motion:reduce){.live{animation:none}}
@@ -84,10 +91,12 @@ tr:hover td{background:#ffffff08}
     <option value="180"{% if selected_range == '180' %} selected{% endif %}>Últimas 3 horas</option>
     <option value="360"{% if selected_range == '360' %} selected{% endif %}>Últimas 6 horas</option>
   </select></label>
+  <button class="btn" id="sound-toggle" type="button" aria-pressed="false">🔔 Som: OFF</button>
   <button class="btn" id="go" type="button">Atualizar</button>
   <button class="btn" id="tv-fullscreen-btn" type="button">Tela Cheia (F11)</button>
   <a class="btn" href="{% url 'plugins:netbox_monitor:monitor' %}">Voltar ao NetBox</a>
 </header>
+<div class="noc-alert" id="noc-alert" role="alert" aria-live="assertive"></div>
 <main id="m"></main>
 <div class="tip" id="tip"></div>
 
@@ -215,11 +224,18 @@ function emptyRow(cols,msg){return'<tr><td colspan="'+cols+'" class="mono">'+esc
 function renderDevices(rows){var el=document.getElementById("pdev");
   var head='<tr><th>Host</th><th>IP</th><th>Status</th><th>CPU</th><th>Memória</th><th>Latência</th><th>Tráfego (Mbps)</th><th>Portas</th><th>Uptime</th><th>SLA</th></tr>';
   if(!rows.length){el.innerHTML=head+emptyRow(10,"Nenhum dispositivo monitorado para o filtro selecionado.");return}
-  el.innerHTML=head+rows.map(function(r){
+  var alertSet={};activeAlerts().forEach(function(name){alertSet[name]=1});
+  var ordered=(rows||[]).slice().sort(function(a,b){
+    var aa=alertSet[a.name]?0:1,bb=alertSet[b.name]?0:1;
+    if(aa!==bb)return aa-bb;
+    return String(a.name).localeCompare(String(b.name));
+  });
+  el.innerHTML=head+ordered.map(function(r){
     var net=(r.download_mbps==null&&r.upload_mbps==null)?"N/A":"↓ "+fmt(r.download_mbps,2)+" / ↑ "+fmt(r.upload_mbps,2);
     var ports=r.total_ports?r.active_ports+" / "+r.total_ports:"N/A";
     var sla=r.sla_percent==null?"N/A":fmt(r.sla_percent,2)+"%";
-    return"<tr><td>"+esc(r.name)+"</td><td class='mono'>"+esc(r.ip)+"</td><td>"+pill(r.status)+"</td><td>"+barCell(r.cpu)+"</td><td>"+barCell(r.memory)+"</td><td class='mono'>"+(r.latency_ms==null?"N/A":fmt(r.latency_ms,1)+" ms")+"</td><td class='mono'>"+net+"</td><td>"+ports+"</td><td class='mono'>"+esc(r.uptime||"N/A")+"</td><td>"+sla+"</td></tr>";
+    var cls=alertSet[r.name]?" class='alert-row'":"";
+    return"<tr"+cls+"><td>"+esc(r.name)+"</td><td class='mono'>"+esc(r.ip)+"</td><td>"+pill(r.status)+"</td><td>"+barCell(r.cpu)+"</td><td>"+barCell(r.memory)+"</td><td class='mono'>"+(r.latency_ms==null?"N/A":fmt(r.latency_ms,1)+" ms")+"</td><td class='mono'>"+net+"</td><td>"+ports+"</td><td class='mono'>"+esc(r.uptime||"N/A")+"</td><td>"+sla+"</td></tr>";
   }).join("")}
 
 function renderTop(rows){var el=document.getElementById("ptop");
@@ -368,7 +384,7 @@ function deviceRowsFromLive(devicesPayload){
       port_percent:portPercent,
       uptime:dev.uptime,
       sla_percent:dev.sla_percent,
-      stp_alert:null,
+      stp_alert:dev.stp_alert===true,
       has_metric:dev.has_metric!==false
     });
   });
@@ -408,11 +424,93 @@ function applyLive(d){
   DATA.generated_at=d.server_time;
 }
 
+/* ================= ALERTAS SONOROS (NOC TV) ================= */
+var soundOn=false,audioCtx=null;
+var ALERT_HOLD_MS=30000;
+var prevDeviceState={},alertState={};
+
+function ensureAudio(){
+  if(!audioCtx){
+    var AC=window.AudioContext||window.webkitAudioContext;
+    if(AC){try{audioCtx=new AC()}catch(e){audioCtx=null}}
+  }
+  return audioCtx;
+}
+function beep(){
+  var ctx=ensureAudio();
+  if(!ctx)return;
+  if(ctx.state==="suspended"){ctx.resume().catch(function(){})}
+  var t=ctx.currentTime;
+  [0,0.18].forEach(function(offset){
+    var osc=ctx.createOscillator(),gain=ctx.createGain();
+    osc.type="sine";
+    osc.frequency.setValueAtTime(880,t+offset);
+    gain.gain.setValueAtTime(0.0001,t+offset);
+    gain.gain.exponentialRampToValueAtTime(0.12,t+offset+0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001,t+offset+0.14);
+    osc.connect(gain);gain.connect(ctx.destination);
+    osc.start(t+offset);osc.stop(t+offset+0.16);
+  });
+}
+var soundBtn=document.getElementById("sound-toggle");
+function setSound(on){
+  soundOn=on;
+  soundBtn.textContent="🔔 Som: "+(on?"ON":"OFF");
+  soundBtn.setAttribute("aria-pressed",on?"true":"false");
+  soundBtn.classList.toggle("on",on);
+}
+soundBtn.onclick=function(){setSound(!soundOn);if(soundOn){ensureAudio();beep()}};
+
+function activeAlerts(){
+  var now=Date.now(),names=[];
+  Object.keys(alertState).forEach(function(name){
+    if(alertState[name]>now){names.push(name)}else{delete alertState[name]}
+  });
+  return names;
+}
+function refreshAlertBanner(){
+  var el=document.getElementById("noc-alert"),names=activeAlerts();
+  if(!names.length){el.classList.remove("on");el.textContent="";return}
+  var shown=names.slice(0,6).join(", ");
+  if(names.length>6){shown+=" +"+(names.length-6)}
+  el.textContent="🔴 Queda / STP: "+shown;
+  el.classList.add("on");
+}
+function seedDeviceState(){
+  prevDeviceState={};alertState={};
+  (DATA.devices||[]).forEach(function(r){
+    prevDeviceState[r.name]={
+      status:String(r.status||"").toUpperCase(),
+      stp:r.stp_alert===true
+    };
+  });
+}
+function detectAlerts(d){
+  var freshDown=[],freshStp=[],now=Date.now();
+  Object.keys(d.devices||{}).forEach(function(key){
+    var dev=d.devices[key],name=dev.name;
+    var status=String(dev.status||"").toUpperCase();
+    var stp=dev.stp_alert===true;
+    var prev=prevDeviceState[name];
+    if(prev){
+      if(prev.status==="ONLINE"&&status==="OFFLINE"){freshDown.push(name)}
+      if(stp&&!prev.stp){freshStp.push(name)}
+    }
+    if(status==="OFFLINE"||stp){alertState[name]=now+ALERT_HOLD_MS}
+    else{delete alertState[name]}
+    prevDeviceState[name]={status:status,stp:stp};
+  });
+  if((freshDown.length||freshStp.length)&&soundOn){beep()}
+  refreshAlertBanner();
+  return freshDown;
+}
+
 function refreshLive(){
   return fetch(LIVE_ENDPOINT,{cache:'no-store'})
     .then(function(response){return response.ok?response.json():Promise.reject(response)})
     .then(function(d){
       var s=d.summary;
+      detectAlerts(d);
       pushLivePoint(d.server_time,s.traffic_download_mbps,s.traffic_upload_mbps,s.avg_latency_ms,s.cpu_avg,s.memory_avg);
       applyLive(d);
       render();
@@ -425,7 +523,7 @@ function tvIsFS(){return Boolean(document.fullscreenElement||document.webkitFull
 fullscreenBtn.onclick=function(){if(tvIsFS()){document.exitFullscreen();}else{document.documentElement.requestFullscreen();}};
 document.addEventListener("fullscreenchange",function(){fullscreenBtn.textContent=tvIsFS()?"Sair da Tela Cheia (F11)":"Tela Cheia (F11)"});
 
-addEventListener("resize",render);render();seedLiveTrend();
+addEventListener("resize",render);seedDeviceState();setSound(false);render();seedLiveTrend();
 setInterval(function(){if(!document.hidden){refreshLive()}},LIVE_REFRESH_MS);
 </script>
 </body>

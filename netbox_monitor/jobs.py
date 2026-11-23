@@ -1,7 +1,11 @@
 import asyncio
 import json
 import logging
+import os
 import re
+import sys
+import threading
+import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
@@ -97,6 +101,9 @@ SNMP_MAX_NEIGHBORS = 512
 HARDWARE_COLLECTION_TIMEOUT = 4
 POE_COLLECTION_TIMEOUT = 4
 NEIGHBOR_COLLECTION_TIMEOUT = 6
+FAST_PING_INTERVAL = 5
+FAST_PING_MAX_WORKERS = 32
+_FAST_PING_LOCK_KEY = 0x4E42504D
 
 ENTITY_SENSOR_TYPE_CELSIUS = 8
 ENTITY_SENSOR_TYPE_RPM = 10
@@ -324,10 +331,23 @@ async def _collect_vlans(engine, auth, target, context, index_to_name, sys_descr
     return vlans_summary, pvid_by_index, tagged_by_index
 
 
-async def _collect_loop_status(engine, auth, target, context, index_to_name):
+async def _collect_loop_status(engine, auth, target, context, index_to_name, active_if_indexes=None):
     top_changes = None
     time_since_top_change = None
     port_states = {}
+    bridge_to_if = {}
+
+    try:
+        bridge_values = await _snmp_walk(
+            engine, auth, target, context, OID_DOT1D_BASE_PORT_IF_INDEX, SNMP_MAX_BRIDGE_PORTS
+        )
+        for oid, value in bridge_values.items():
+            b_port = _oid_index(oid)
+            if_idx = _to_int(value)
+            if if_idx is not None:
+                bridge_to_if[b_port] = if_idx
+    except Exception:
+        bridge_to_if = {}
 
     try:
         value = await _snmp_get(engine, auth, target, context, OID_DOT1D_STP_TOP_CHANGES)
@@ -349,35 +369,39 @@ async def _collect_loop_status(engine, auth, target, context, index_to_name):
         )
         for oid, value in state_values.items():
             state = _to_int(value)
-            port_states[_oid_index(oid)] = STP_PORT_STATES.get(state, str(state))
+            b_port = _oid_index(oid)
+            real_idx = bridge_to_if.get(b_port, b_port)
+            port_states[real_idx] = STP_PORT_STATES.get(state, str(state))
     except Exception:
         port_states = {}
 
-    blocked_ports = [
-        index_to_name.get(index, f'ifIndex {index}')
-        for index, state in port_states.items()
-        if state in STP_ALERT_STATES
-    ]
+    recent_change = (
+        time_since_top_change is not None
+        and 0 <= time_since_top_change < 9000
+    )
+
+    blocked_ports = []
+    for index, state in port_states.items():
+        if active_if_indexes is not None and index not in active_if_indexes:
+            continue
+        if state == 'BROKEN':
+            blocked_ports.append(index_to_name.get(index, f'ifIndex {index}'))
+        elif state == 'BLOCKING' and recent_change:
+            blocked_ports.append(index_to_name.get(index, f'ifIndex {index}'))
 
     reasons = []
     if blocked_ports:
         reasons.append(
-            'Portas em estado de bloqueio/loop: {}.'.format(', '.join(blocked_ports))
+            'Portas bloqueadas por loop/STP ativo: {}.'.format(', '.join(blocked_ports))
         )
-    if (
-        time_since_top_change is not None
-        and time_since_top_change < STP_RECENT_CHANGE_HUNDREDTHS
-    ):
-        minutes = max(time_since_top_change, 0) / 6000
+    if blocked_ports and recent_change:
+        seconds = max(time_since_top_change, 0) / 100
         reasons.append(
-            'Mudança de topologia STP detectada há {:.1f} minuto(s).'.format(minutes)
+            'Mudança de topologia STP há {:.0f}s.'.format(seconds)
         )
 
-    has_alert = bool(blocked_ports) or (
-        time_since_top_change is not None
-        and time_since_top_change < STP_RECENT_CHANGE_HUNDREDTHS
-    )
-    reason = ' '.join(reasons) if reasons else 'STP estável, sem bloqueios ou mudanças recentes.'
+    has_alert = bool(blocked_ports)
+    reason = ' '.join(reasons) if reasons else 'STP estável, sem bloqueios ativos de loop.'
 
     return {
         'has_alert': has_alert,
@@ -942,8 +966,13 @@ async def _collect_snmp_async(ip, community):
     vlans_summary, pvid_by_index, tagged_by_index = await _collect_vlans(
         engine, auth, target, context, index_to_name, sys_descr
     )
+    active_if_indexes = {
+        _oid_index(oid)
+        for oid, st in status_values.items()
+        if _to_int(st) == 1
+    }
     loop_status, stp_states = await _collect_loop_status(
-        engine, auth, target, context, index_to_name
+        engine, auth, target, context, index_to_name, active_if_indexes
     )
 
     interfaces = []
@@ -1171,12 +1200,18 @@ def _critical_port_alerts(device, previous, data):
     return alerts
 
 
-def check_metric_alerts(device, data):
-    previous = DeviceMetric.objects.filter(device=device).order_by('-timestamp').first()
+def check_metric_alerts(device, data, previous=None, settings_obj=None):
+    if previous is None:
+        previous = (
+            DeviceMetric.objects.filter(device=device)
+            .order_by('-timestamp')
+            .first()
+        )
     if previous is None:
         return
 
-    settings_obj = MonitorSettings.get_solo()
+    if settings_obj is None:
+        settings_obj = MonitorSettings.get_solo()
     alerts = []
     if previous.is_online and not data.get('is_online'):
         alerts.append(
@@ -1331,3 +1366,231 @@ class DeviceMonitorJob(JobRunner):
 
         deleted = cleanup_old_metrics()
         self.logger.info(f'Limpeza de histórico: {deleted} registro(s) removido(s)')
+
+
+def _ping_only(ip):
+    import icmplib
+
+    try:
+        host = icmplib.ping(
+            str(ip), count=1, timeout=PING_TIMEOUT, privileged=False
+        )
+        if not host.is_alive:
+            return False, None
+        latency = round(host.avg_rtt, 2) if host.avg_rtt is not None else None
+        return True, latency
+    except Exception:
+        return False, None
+
+
+def run_fast_ping_cycle():
+    """Pinga todos os dispositivos e atualiza apenas status/latência.
+
+    A métrica mais recente de cada dispositivo é atualizada no lugar, de modo
+    que os últimos dados SNMP (portas, tráfego, VLANs, hardware) permanecem
+    intactos e os contadores não são zerados.
+    """
+    devices = Device.objects.filter(
+        primary_ip4__isnull=False
+    ) | Device.objects.filter(primary_ip6__isnull=False)
+
+    tagged = devices.filter(tags__name='monitorar').distinct()
+    if tagged.exists():
+        devices = tagged
+    else:
+        devices = devices.distinct()
+
+    devices = list(devices.select_related('primary_ip4', 'primary_ip6'))
+
+    targets = []
+    for device in devices:
+        if device.primary_ip is None:
+            continue
+        ip = str(device.primary_ip.address).split('/')[0]
+        targets.append((device, ip))
+
+    if not targets:
+        return {'checked': 0, 'online': 0, 'updated': 0, 'created': 0}
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=FAST_PING_MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(_ping_only, ip): device
+            for device, ip in targets
+        }
+        for future in as_completed(futures):
+            device = futures[future]
+            try:
+                results[device.pk] = future.result()
+            except Exception:
+                results[device.pk] = (False, None)
+
+    device_ids = [device.pk for device, _ in targets]
+    latest = {}
+    for metric in (
+        DeviceMetric.objects.filter(device_id__in=device_ids)
+        .order_by('device_id', '-timestamp')
+        .distinct('device_id')
+    ):
+        latest[metric.device_id] = metric
+
+    settings_obj = MonitorSettings.get_solo()
+    to_update = []
+    to_create = []
+    online_count = 0
+
+    for device, ip in targets:
+        is_online, latency_ms = results.get(device.pk, (False, None))
+        if is_online:
+            online_count += 1
+
+        metric = latest.get(device.pk)
+        if metric is None:
+            to_create.append(
+                DeviceMetric(
+                    device=device,
+                    is_online=is_online,
+                    latency_ms=latency_ms,
+                    interfaces_summary=[],
+                    vlans_summary=[],
+                    loop_status={},
+                    hardware_metrics={},
+                )
+            )
+            continue
+
+        alert_data = {
+            'is_online': is_online,
+            'latency_ms': latency_ms,
+            'loop_status': metric.loop_status or {},
+            'interfaces_summary': metric.interfaces_summary or [],
+        }
+        check_metric_alerts(
+            device,
+            alert_data,
+            previous=metric,
+            settings_obj=settings_obj,
+        )
+
+        metric.is_online = is_online
+        metric.latency_ms = latency_ms
+        to_update.append(metric)
+
+    if to_create:
+        DeviceMetric.objects.bulk_create(to_create)
+    if to_update:
+        DeviceMetric.objects.bulk_update(to_update, ['is_online', 'latency_ms'])
+
+    return {
+        'checked': len(targets),
+        'online': online_count,
+        'updated': len(to_update),
+        'created': len(to_create),
+    }
+
+
+_fast_ping_thread_lock = threading.Lock()
+_fast_ping_thread = None
+_fast_ping_thread_started = False
+
+
+def _acquire_fast_ping_leader():
+    from django.db import connection
+
+    try:
+        if connection.vendor != 'postgresql':
+            return True
+        connection.ensure_connection()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                'SELECT pg_try_advisory_lock(%s)', [_FAST_PING_LOCK_KEY]
+            )
+            row = cursor.fetchone()
+        return bool(row and row[0])
+    except Exception as exc:
+        logger.debug('Fast ping: falha ao adquirir liderança: %s', exc)
+        try:
+            connection.close()
+        except Exception:
+            pass
+        return False
+
+
+def _fast_ping_loop():
+    from django.db import connection
+
+    leader = False
+    while True:
+        try:
+            if not leader:
+                leader = _acquire_fast_ping_leader()
+                if not leader:
+                    time.sleep(FAST_PING_INTERVAL)
+                    continue
+                logger.info(
+                    'NetBox Monitor: fast ping daemon assumiu a liderança.'
+                )
+
+            started = time.monotonic()
+            stats = run_fast_ping_cycle()
+            logger.debug('Fast ping: %s', stats)
+            elapsed = time.monotonic() - started
+            time.sleep(max(0.5, FAST_PING_INTERVAL - elapsed))
+        except Exception as exc:
+            logger.warning(
+                'NetBox Monitor: falha no ciclo de fast ping: %s', exc
+            )
+            leader = False
+            try:
+                connection.close()
+            except Exception:
+                pass
+            time.sleep(FAST_PING_INTERVAL)
+
+
+def start_fast_ping_daemon():
+    global _fast_ping_thread, _fast_ping_thread_started
+
+    if _fast_ping_thread_started:
+        return False
+
+    with _fast_ping_thread_lock:
+        if _fast_ping_thread_started:
+            return False
+        _fast_ping_thread = threading.Thread(
+            target=_fast_ping_loop,
+            name='netbox-monitor-fast-ping',
+            daemon=True,
+        )
+        _fast_ping_thread_started = True
+        _fast_ping_thread.start()
+
+    logger.info(
+        'NetBox Monitor: fast ping daemon iniciado (intervalo de %ss).',
+        FAST_PING_INTERVAL,
+    )
+    return True
+
+
+def should_start_fast_ping_daemon():
+    if os.environ.get('NETBOX_MONITOR_FAST_PING', '').lower() in (
+        '0',
+        'false',
+        'off',
+        'no',
+    ):
+        return False
+
+    joined = ' '.join(sys.argv).lower()
+    maintenance = (
+        'migrate',
+        'makemigrations',
+        'collectstatic',
+        'shell',
+        'createsuperuser',
+        'loaddata',
+        'dumpdata',
+        'test',
+        'check',
+    )
+    return not any(command in joined for command in maintenance)
