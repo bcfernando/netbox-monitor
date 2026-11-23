@@ -84,9 +84,6 @@ tr:hover td{background:#ffffff08}
     <option value="180"{% if selected_range == '180' %} selected{% endif %}>Últimas 3 horas</option>
     <option value="360"{% if selected_range == '360' %} selected{% endif %}>Últimas 6 horas</option>
   </select></label>
-  <label class="v"><span>↻</span><select id="rf">
-    <option value="0">Off</option><option value="10000" selected>10s</option><option value="30000">30s</option><option value="60000">1m</option>
-  </select></label>
   <button class="btn" id="go" type="button">Atualizar</button>
   <button class="btn" id="tv-fullscreen-btn" type="button">Tela Cheia (F11)</button>
   <a class="btn" href="{% url 'plugins:netbox_monitor:monitor' %}">Voltar ao NetBox</a>
@@ -315,23 +312,121 @@ function navigate(params){
 document.getElementById("site").onchange=function(){navigate({site:this.value,device:""})};
 document.getElementById("device").onchange=function(){navigate({device:this.value})};
 document.getElementById("range").onchange=function(){navigate({range:this.value})};
-document.getElementById("go").onclick=function(){window.location.reload()};
+document.getElementById("go").onclick=function(){refreshLive()};
 
-var rf=document.getElementById("rf"),timer=null;
-try{var saved=sessionStorage.getItem("noc-refresh");if(saved!==null)rf.value=saved}catch(e){}
-function sched(){
-  clearTimeout(timer);
-  var v=+rf.value;
-  if(v>0)timer=setTimeout(function(){window.location.reload()},v);
+var LIVE_ENDPOINT='/plugins/monitor/api/live/';
+var LIVE_REFRESH_MS=3000;
+var LIVE_WINDOW=30;
+var liveTrend={labels:[],download:[],upload:[],latency:[],cpu:[],memory:[]};
+
+function seedLiveTrend(){
+  liveTrend.labels=(DATA.trend&&DATA.trend.labels)?DATA.trend.labels.slice():[];
+  liveTrend.download=(DATA.trend&&DATA.trend.download)?DATA.trend.download.slice():[];
+  liveTrend.upload=(DATA.trend&&DATA.trend.upload)?DATA.trend.upload.slice():[];
+  liveTrend.latency=(DATA.trend&&DATA.trend.latency)?DATA.trend.latency.slice():[];
+  liveTrend.cpu=(DATA.trend&&DATA.trend.cpu)?DATA.trend.cpu.slice():[];
+  liveTrend.memory=(DATA.trend&&DATA.trend.memory)?DATA.trend.memory.slice():[];
 }
-rf.onchange=function(){try{sessionStorage.setItem("noc-refresh",rf.value)}catch(e){}sched()};
+
+function pushLivePoint(serverTime,download,upload,latency,cpu,memory){
+  liveTrend.labels.push(serverTime);
+  liveTrend.download.push(download);
+  liveTrend.upload.push(upload);
+  liveTrend.latency.push(latency);
+  liveTrend.cpu.push(cpu);
+  liveTrend.memory.push(memory);
+  if(liveTrend.labels.length>LIVE_WINDOW){
+    liveTrend.labels.shift();
+    liveTrend.download.shift();
+    liveTrend.upload.shift();
+    liveTrend.latency.shift();
+    liveTrend.cpu.shift();
+    liveTrend.memory.shift();
+  }
+}
+
+function deviceRowsFromLive(devicesPayload){
+  var out=[];
+  Object.keys(devicesPayload||{}).forEach(function(key){
+    var dev=devicesPayload[key];
+    var portPercent=null;
+    if(dev.total_ports>0){
+      portPercent=Math.round(((dev.active_ports||0)/dev.total_ports)*1000)/10;
+    }
+    out.push({
+      name:dev.name,
+      ip:dev.ip,
+      status:dev.status,
+      cpu:dev.cpu_percent,
+      memory:dev.memory_percent,
+      latency_ms:dev.latency_ms,
+      download_mbps:dev.download_mbps,
+      upload_mbps:dev.upload_mbps,
+      traffic_total:dev.traffic_total_mbps,
+      active_ports:dev.active_ports,
+      total_ports:dev.total_ports,
+      port_percent:portPercent,
+      uptime:dev.uptime,
+      sla_percent:dev.sla_percent,
+      stp_alert:null,
+      has_metric:dev.has_metric!==false
+    });
+  });
+  return out;
+}
+
+function latencyBarsFromLive(devicesPayload){
+  var bars=[];
+  Object.keys(devicesPayload||{}).forEach(function(key){
+    var dev=devicesPayload[key];
+    if(dev.latency_ms===null||dev.latency_ms===undefined){return}
+    bars.push({label:dev.name,value:dev.latency_ms,unit:' ms'});
+  });
+  bars.sort(function(a,b){return (b.value||0)-(a.value||0)});
+  return bars.slice(0,8);
+}
+
+function applyLive(d){
+  DATA.server_time=d.server_time;
+  DATA.summary=d.summary;
+  DATA.gauges={cpu:d.summary.cpu_avg,memory:d.summary.memory_avg,ports:d.summary.ports_avg,sla:d.summary.sla_avg};
+  DATA.status_donut=[
+    {label:'Online',value:d.summary.online,color:'#73bf69'},
+    {label:'Offline',value:d.summary.offline,color:'#f2495c'},
+    {label:'Sem dados',value:d.summary.no_data,color:'#5794f2'}
+  ];
+  DATA.trend={
+    labels:liveTrend.labels,
+    cpu:liveTrend.cpu,
+    memory:liveTrend.memory,
+    download:liveTrend.download,
+    upload:liveTrend.upload,
+    latency:liveTrend.latency
+  };
+  DATA.devices=deviceRowsFromLive(d.devices);
+  DATA.latency_bars=latencyBarsFromLive(d.devices);
+  DATA.generated_at=d.server_time;
+}
+
+function refreshLive(){
+  return fetch(LIVE_ENDPOINT,{cache:'no-store'})
+    .then(function(response){return response.ok?response.json():Promise.reject(response)})
+    .then(function(d){
+      var s=d.summary;
+      pushLivePoint(d.server_time,s.traffic_download_mbps,s.traffic_upload_mbps,s.avg_latency_ms,s.cpu_avg,s.memory_avg);
+      applyLive(d);
+      render();
+    })
+    .catch(function(){return null});
+}
 
 var fullscreenBtn=document.getElementById("tv-fullscreen-btn");
 function tvIsFS(){return Boolean(document.fullscreenElement||document.webkitFullscreenElement||document.msFullscreenElement)}
 fullscreenBtn.onclick=function(){if(tvIsFS()){document.exitFullscreen();}else{document.documentElement.requestFullscreen();}};
 document.addEventListener("fullscreenchange",function(){fullscreenBtn.textContent=tvIsFS()?"Sair da Tela Cheia (F11)":"Tela Cheia (F11)"});
 
-addEventListener("resize",render);render();sched();
+addEventListener("resize",render);render();seedLiveTrend();
+setInterval(function(){if(!document.hidden){refreshLive()}},LIVE_REFRESH_MS);
 </script>
 </body>
 </html>

@@ -1,5 +1,7 @@
 import csv
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 
 from django.apps import apps
@@ -7,9 +9,9 @@ from django.contrib import messages
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.contrib.contenttypes.models import ContentType
 from django.core.exceptions import PermissionDenied
-from django.db import transaction
+from django.db import close_old_connections, transaction
 from django.db.models import Count, Q
-from django.http import HttpResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.utils import timezone
@@ -1183,35 +1185,265 @@ class SyncSnmpToNetboxView(LoginRequiredMixin, View):
 
 class CollectAllView(LoginRequiredMixin, View):
     def post(self, request, *args, **kwargs):
-        import threading
-        from django.db import close_old_connections
-        from django.test import RequestFactory
-        from dcim.models import Device
-
-        user = request.user
-
         def _bg_worker():
-            rf = RequestFactory()
-            devs = (Device.objects.filter(primary_ip4__isnull=False) | Device.objects.filter(primary_ip6__isnull=False)).distinct().order_by('name')
-            total = devs.count()
-            print(f'[NetBox Monitor] Iniciando coleta completa de {total} dispositivos...', flush=True)
-            for idx, d in enumerate(devs, 1):
+            devs = list(
+                Device.objects.filter(
+                    Q(primary_ip4__isnull=False) | Q(primary_ip6__isnull=False)
+                ).distinct().order_by('name')
+            )
+            total = len(devs)
+            print(
+                f'[NetBox Monitor] Iniciando coleta paralela de {total} dispositivos '
+                f'com ThreadPoolExecutor(max_workers=16)...',
+                flush=True,
+            )
+
+            def _collect_one(d):
                 try:
-                    fake_req = rf.post(f'/plugins/monitor/device/{d.pk}/collect/')
-                    fake_req.user = user
-                    from django.contrib.messages.storage.fallback import FallbackStorage
-                    setattr(fake_req, 'session', 'session')
-                    setattr(fake_req, '_messages', FallbackStorage(fake_req))
-                    CollectNowView.as_view()(fake_req, pk=d.pk)
-                    print(f'[NetBox Monitor] [{idx}/{total}] {d.name} OK', flush=True)
+                    ip = str(d.primary_ip.address).split('/')[0]
+                    community = d.cf.get('snmp_community') or 'public'
+                    _collect_now(d, ip, community)
+                    return d.name, True, None
                 except Exception as ex:
-                    print(f'[NetBox Monitor] [{idx}/{total}] {d.name} aviso: {ex}', flush=True)
+                    return d.name, False, str(ex)
+                finally:
+                    close_old_connections()
+
+            with ThreadPoolExecutor(max_workers=16) as executor:
+                futures = {executor.submit(_collect_one, d): d for d in devs}
+                for idx, future in enumerate(as_completed(futures), 1):
+                    name, ok, err = future.result()
+                    if ok:
+                        print(f'[NetBox Monitor] [{idx}/{total}] {name} OK', flush=True)
+                    else:
+                        print(f'[NetBox Monitor] [{idx}/{total}] {name} aviso: {err}', flush=True)
+
             close_old_connections()
-            print('[NetBox Monitor] Coleta em lote finalizada!', flush=True)
+            print('[NetBox Monitor] Coleta paralela em lote finalizada!', flush=True)
 
         threading.Thread(target=_bg_worker, daemon=True).start()
-        messages.success(request, 'Coleta em lote iniciada em segundo plano! Atualize a pagina em ~15 segundos.')
-        return redirect('login')
+        messages.success(
+            request,
+            'Coleta paralela em lote (16 workers) iniciada em segundo plano! '
+            'Acompanhe o progresso nos logs do servidor.',
+        )
+        return redirect('plugins:netbox_monitor:monitor')
+
+
+_TV_RANGE_OPTIONS = (30, 60, 180, 360)
+
+
+def _tv_range_minutes(request):
+    try:
+        value = int(request.GET.get('range', '60'))
+    except (TypeError, ValueError):
+        return 60
+    return value if value in _TV_RANGE_OPTIONS else 60
+
+
+def _tv_avg(values):
+    numbers = [float(value) for value in values if value is not None]
+    if not numbers:
+        return None
+    return round(sum(numbers) / len(numbers), 1)
+
+
+def _tv_site_options(devices):
+    sites = {}
+    for device in devices:
+        site = getattr(device, 'site', None)
+        if site is not None:
+            sites[site.slug] = site.name
+    return [
+        {'value': slug, 'label': name}
+        for slug, name in sorted(sites.items(), key=lambda item: item[1].lower())
+    ]
+
+
+def _tv_device_options(devices):
+    return [
+        {
+            'value': str(device.pk),
+            'label': str(device.name),
+            'site': device.site.slug if getattr(device, 'site', None) else '',
+        }
+        for device in devices
+    ]
+
+
+def _tv_filter_devices(devices, site, device_id):
+    filtered = devices
+    if site:
+        filtered = [
+            device for device in filtered
+            if getattr(device, 'site', None) is not None
+            and device.site.slug == site
+        ]
+    if device_id.isdigit():
+        filtered = [
+            device for device in filtered if device.pk == int(device_id)
+        ]
+    return filtered
+
+
+def _tv_trend_series(devices, minutes):
+    now = timezone.now()
+    start = now - timedelta(minutes=minutes)
+    metrics = (
+        DeviceMetric.objects.filter(device__in=devices, timestamp__gte=start)
+        .order_by('device_id', 'timestamp')
+    )
+    prior_metrics = (
+        DeviceMetric.objects.filter(device__in=devices, timestamp__lt=start)
+        .order_by('device_id', '-timestamp')
+        .distinct('device_id')
+    )
+    last_by_device = {metric.device_id: metric for metric in prior_metrics}
+
+    buckets = {}
+    for metric in metrics:
+        interface_rows = _interfaces_with_rates(
+            metric, last_by_device.get(metric.device_id)
+        )
+        last_by_device[metric.device_id] = metric
+        minute = metric.timestamp.replace(second=0, microsecond=0)
+        bucket = buckets.setdefault(
+            minute,
+            {
+                'download': 0.0,
+                'upload': 0.0,
+                'has_traffic': False,
+                'cpu': [],
+                'memory': [],
+                'latency': [],
+            },
+        )
+        for interface in interface_rows:
+            download = interface.get('download_mbps')
+            upload = interface.get('upload_mbps')
+            if download is not None:
+                bucket['download'] += float(download)
+                bucket['has_traffic'] = True
+            if upload is not None:
+                bucket['upload'] += float(upload)
+                bucket['has_traffic'] = True
+        if metric.cpu_percent is not None:
+            bucket['cpu'].append(float(metric.cpu_percent))
+        if metric.memory_percent is not None:
+            bucket['memory'].append(float(metric.memory_percent))
+        if metric.latency_ms is not None:
+            bucket['latency'].append(float(metric.latency_ms))
+
+    points = _downsample(sorted(buckets.items()), _MAX_CHART_POINTS)
+    return {
+        'labels': [point[0].strftime('%H:%M') for point in points],
+        'download': [
+            round(point[1]['download'], 2) if point[1]['has_traffic'] else None
+            for point in points
+        ],
+        'upload': [
+            round(point[1]['upload'], 2) if point[1]['has_traffic'] else None
+            for point in points
+        ],
+        'cpu': [_tv_avg(point[1]['cpu']) for point in points],
+        'memory': [_tv_avg(point[1]['memory']) for point in points],
+        'latency': [_tv_avg(point[1]['latency']) for point in points],
+    }
+
+
+def _tv_availability(devices, limit=36):
+    rows = []
+    for device in devices:
+        metrics = list(
+            DeviceMetric.objects.filter(device=device).order_by('-timestamp')[:limit]
+        )
+        metrics.reverse()
+        rows.append({
+            'device': str(device.name),
+            'cells': [
+                {
+                    'time': metric.timestamp.strftime('%H:%M:%S'),
+                    'timestamp': metric.timestamp.isoformat(),
+                    'online': bool(metric.is_online),
+                    'latency_ms': metric.latency_ms,
+                }
+                for metric in metrics
+            ],
+        })
+    return rows
+
+
+def _tv_device_rows(rows):
+    devices = []
+    for row in rows:
+        metric = row['metric']
+        devices.append({
+            'name': str(row['device'].name),
+            'ip': row['ip'] or 'N/A',
+            'status': (
+                'ONLINE' if row['is_online']
+                else 'OFFLINE' if metric is not None
+                else 'NO DATA'
+            ),
+            'cpu': (
+                round(float(metric.cpu_percent), 1)
+                if metric is not None and metric.cpu_percent is not None
+                else None
+            ),
+            'memory': (
+                round(float(metric.memory_percent), 1)
+                if metric is not None and metric.memory_percent is not None
+                else None
+            ),
+            'latency_ms': (
+                round(float(metric.latency_ms), 1)
+                if metric is not None and metric.latency_ms is not None
+                else None
+            ),
+            'download_mbps': row['download_mbps'],
+            'upload_mbps': row['upload_mbps'],
+            'traffic_total': row['traffic_total'],
+            'active_ports': row['active_ports'],
+            'total_ports': row['total_ports'],
+            'port_percent': row['port_percent'],
+            'uptime': (
+                row['uptime']
+                if metric is not None and row['uptime'] != '-'
+                else None
+            ),
+            'sla_percent': row['sla_percent'],
+            'stp_alert': row['stp_alert'],
+            'has_metric': metric is not None,
+        })
+    return devices
+
+
+def _tv_incident_payload(events):
+    return [
+        {
+            'timestamp': event['timestamp'].strftime('%d/%m %H:%M:%S'),
+            'iso': event['timestamp'].isoformat(),
+            'status': event['event_type'],
+            'device': str(event['device']),
+            'description': event['description'],
+        }
+        for event in events
+    ]
+
+
+def _tv_alerts_by_hour(events, now):
+    hour_start = now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=23)
+    hours = [hour_start + timedelta(hours=index) for index in range(24)]
+    counts = [0] * 24
+    for event in events:
+        offset = int((event['timestamp'] - hour_start).total_seconds() // 3600)
+        if 0 <= offset < 24:
+            counts[offset] += 1
+    return {
+        'labels': [hour.strftime('%H:00') for hour in hours],
+        'values': counts,
+    }
+
 
 class NocTvDashboardView(LoginRequiredMixin, View):
     def get(self, request):
@@ -1333,6 +1565,114 @@ class NocTvDashboardView(LoginRequiredMixin, View):
                 'noc_data': noc_data,
             },
         )
+
+
+class LiveMetricsApiView(LoginRequiredMixin, View):
+    def get(self, request):
+        devices = _monitored_devices(request)
+        rows = _build_noc_rows(devices)
+
+        online_count = sum(1 for row in rows if row['is_online'])
+        offline_count = sum(1 for row in rows if not row['is_online'])
+        no_data_count = sum(1 for row in rows if row['metric'] is None)
+        stp_alert_count = sum(1 for row in rows if row['stp_alert'])
+
+        traffic_download_mbps = sum(
+            float(row['download_mbps'])
+            for row in rows
+            if row['download_mbps'] is not None
+        )
+        traffic_upload_mbps = sum(
+            float(row['upload_mbps'])
+            for row in rows
+            if row['upload_mbps'] is not None
+        )
+        traffic_total_mbps = traffic_download_mbps + traffic_upload_mbps
+
+        latency_values = [
+            float(row['latency_ms'])
+            for row in rows
+            if row['is_online'] and row['latency_ms'] is not None
+        ]
+        avg_latency_ms = (
+            round(sum(latency_values) / len(latency_values), 2)
+            if latency_values
+            else None
+        )
+
+        cpu_values = [
+            float(row['metric'].cpu_percent)
+            for row in rows
+            if row['metric'] is not None and row['metric'].cpu_percent is not None
+        ]
+        memory_values = [
+            float(row['metric'].memory_percent)
+            for row in rows
+            if row['metric'] is not None and row['metric'].memory_percent is not None
+        ]
+        avg_cpu = _tv_avg(cpu_values)
+        avg_memory = _tv_avg(memory_values)
+        avg_ports = _tv_avg(
+            [row['port_percent'] for row in rows if row['port_percent'] is not None]
+        )
+        sla_avg = _tv_avg(
+            [row['sla_percent'] for row in rows if row['sla_percent'] is not None]
+        )
+
+        devices_payload = {}
+        for row in rows:
+            metric = row['metric']
+            device_id = row['device'].pk
+            devices_payload[str(device_id)] = {
+                'device_id': device_id,
+                'name': str(row['device'].name),
+                'ip': row['ip'],
+                'status': row['status'],
+                'has_metric': metric is not None,
+                'latency_ms': row['latency_ms'],
+                'download_mbps': row['download_mbps'],
+                'upload_mbps': row['upload_mbps'],
+                'traffic_total_mbps': row['traffic_total'],
+                'active_ports': row['active_ports'],
+                'total_ports': row['total_ports'],
+                'port_percent': row['port_percent'],
+                'uptime': row['uptime'],
+                'cpu_percent': metric.cpu_percent if metric is not None else None,
+                'memory_percent': (
+                    metric.memory_percent if metric is not None else None
+                ),
+                'sla_percent': row['sla_percent'],
+                'poe_used_watts': row['poe_used'],
+                'last_seen': (
+                    timezone.localtime(metric.timestamp).strftime('%H:%M:%S')
+                    if metric is not None
+                    else None
+                ),
+            }
+
+        payload = {
+            'server_time': timezone.localtime(timezone.now()).strftime('%H:%M:%S'),
+            'summary': {
+                'total': len(rows),
+                'online': online_count,
+                'offline': offline_count,
+                'no_data': no_data_count,
+                'stp_alerts': stp_alert_count,
+                'traffic_download_mbps': round(traffic_download_mbps, 2),
+                'traffic_upload_mbps': round(traffic_upload_mbps, 2),
+                'traffic_total_mbps': round(traffic_total_mbps, 2),
+                'avg_latency_ms': avg_latency_ms,
+                'sla_avg': sla_avg,
+                'cpu_avg': avg_cpu,
+                'memory_avg': avg_memory,
+                'ports_avg': avg_ports,
+                'sla': sla_avg,
+                'traffic_total': round(traffic_total_mbps, 2),
+            },
+            'devices': devices_payload,
+        }
+
+        return JsonResponse(payload, json_dumps_params={'separators': (',', ':')})
 
 
 _TOPOLOGY_DEFAULT_RACK = 'Sem Rack / Geral'

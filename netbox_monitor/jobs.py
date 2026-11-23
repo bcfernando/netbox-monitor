@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import timedelta
 
 from dcim.models import Device, Interface
+from django.db import close_old_connections
 from django.utils import timezone
 from netbox.jobs import JobRunner, system_job
 
@@ -83,7 +84,7 @@ SNMP_TIMEOUT = 2
 SNMP_RETRIES = 0
 SNMP_TOTAL_TIMEOUT = 20
 PING_TIMEOUT = 1
-COLLECT_MAX_WORKERS = 10
+COLLECT_MAX_WORKERS = 16
 SNMP_MAX_INTERFACES = 64
 SNMP_MAX_PROCESSORS = 256
 SNMP_MAX_STORAGE_ENTRIES = 2000
@@ -1304,6 +1305,8 @@ class DeviceMonitorJob(JobRunner):
                         results[device.pk] = future.result()
                     except Exception as exc:
                         self.logger.warning(f'Falha ao coletar {device}: {exc}')
+                    finally:
+                        close_old_connections()
 
         for device, ip, community in targets:
             data = results.get(device.pk)

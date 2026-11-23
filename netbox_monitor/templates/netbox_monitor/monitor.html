@@ -28,7 +28,7 @@
         <div class="form-check form-switch mb-0">
           <input class="form-check-input" type="checkbox" role="switch" id="noc-auto-refresh" checked>
           <label class="form-check-label small text-muted" for="noc-auto-refresh">
-            {% trans "Auto-atualizar (30s)" %}
+            {% trans "Auto-atualizar (5s)" %}
           </label>
         </div>
       </div>
@@ -39,7 +39,7 @@
     <div class="col-md-4">
       <div class="card text-bg-secondary">
         <div class="card-body">
-          <div class="fs-2 fw-bold">{{ total }}</div>
+          <div class="fs-2 fw-bold" id="noc-total">{{ total }}</div>
           <div>{% trans "Total Monitorados" %}</div>
         </div>
       </div>
@@ -47,7 +47,7 @@
     <div class="col-md-4">
       <div class="card text-bg-success">
         <div class="card-body">
-          <div class="fs-2 fw-bold">{{ online }}</div>
+          <div class="fs-2 fw-bold" id="noc-online">{{ online }}</div>
           <div>{% trans "Online" %}</div>
         </div>
       </div>
@@ -55,7 +55,7 @@
     <div class="col-md-4">
       <div class="card text-bg-danger">
         <div class="card-body">
-          <div class="fs-2 fw-bold">{{ offline }}</div>
+          <div class="fs-2 fw-bold" id="noc-offline">{{ offline }}</div>
           <div>{% trans "Offline" %}</div>
         </div>
       </div>
@@ -82,14 +82,14 @@
         </thead>
         <tbody>
           {% for row in rows %}
-            <tr>
+            <tr data-device-id="{{ row.device.pk }}">
               <td><a href="{{ row.device.get_absolute_url }}">{{ row.device }}</a></td>
               <td><code>{{ row.ip }}</code></td>
               <td>
                 {% if row.is_online %}
-                  <span class="badge text-bg-success text-white">ONLINE</span>
+                  <span class="badge text-bg-success text-white js-device-status">ONLINE</span>
                 {% else %}
-                  <span class="badge text-bg-danger text-white">OFFLINE</span>
+                  <span class="badge text-bg-danger text-white js-device-status">OFFLINE</span>
                 {% endif %}
               </td>
               <td>
@@ -100,9 +100,10 @@
                   {{ row.active_ports }} / {{ row.total_ports }}
                 {% else %}—{% endif %}
               </td>
-              <td>
-                {% if row.traffic_total is not None %}
-                  {{ row.traffic_total|floatformat:2 }}
+              <td class="js-device-traffic">
+                {% if row.download_mbps is not None or row.upload_mbps is not None %}
+                  &darr; {% if row.download_mbps is not None %}{{ row.download_mbps|floatformat:2 }} Mbps{% else %}—{% endif %}
+                  / &uarr; {% if row.upload_mbps is not None %}{{ row.upload_mbps|floatformat:2 }} Mbps{% else %}—{% endif %}
                 {% else %}—{% endif %}
               </td>
               <td>
@@ -119,10 +120,10 @@
                   <span class="badge {{ row.sla_badge_class }} text-white">{{ row.sla_percent|floatformat:2 }}%</span>
                 {% else %}—{% endif %}
               </td>
-              <td>
+              <td class="js-device-latency">
                 {% if row.has_latency %}{{ row.metric.latency_ms }} ms{% else %}—{% endif %}
               </td>
-              <td>
+              <td class="js-device-last-seen">
                 {% if row.metric %}{{ row.metric.timestamp|date:"d/m/Y H:i:s" }}{% else %}—{% endif %}
               </td>
             </tr>
@@ -168,8 +169,9 @@
 </div>
 <script>
   (function () {
+    const LIVE_ENDPOINT = '/plugins/monitor/api/live/';
     const STORAGE_KEY = 'netbox-monitor-auto-refresh';
-    const REFRESH_INTERVAL = 30000;
+    const REFRESH_INTERVAL = 5000;
     const toggle = document.getElementById('noc-auto-refresh');
     if (!toggle) {
       return;
@@ -187,9 +189,63 @@
       }
       timer = setInterval(function () {
         if (!document.hidden) {
-          window.location.reload();
+          refreshLive();
         }
       }, REFRESH_INTERVAL);
+    }
+
+    function refreshLive() {
+      return fetch(LIVE_ENDPOINT, { cache: 'no-store' })
+        .then(function (response) {
+          return response.ok ? response.json() : Promise.reject(response);
+        })
+        .then(function (data) { updateLive(data); })
+        .catch(function () { return null; });
+    }
+
+    function fmt(value, decimals) {
+      const num = Number(value);
+      if (value === null || value === undefined || value === '' || Number.isNaN(num)) {
+        return '\u2014';
+      }
+      return num.toFixed(decimals == null ? 2 : decimals);
+    }
+
+    function updateLive(data) {
+      const summary = (data && data.summary) || {};
+      const devices = (data && data.devices) || {};
+
+      const totalEl = document.getElementById('noc-total');
+      const onlineEl = document.getElementById('noc-online');
+      const offlineEl = document.getElementById('noc-offline');
+      if (totalEl) { totalEl.textContent = summary.total != null ? String(summary.total) : totalEl.textContent; }
+      if (onlineEl) { onlineEl.textContent = summary.online != null ? String(summary.online) : onlineEl.textContent; }
+      if (offlineEl) { offlineEl.textContent = summary.offline != null ? String(summary.offline) : offlineEl.textContent; }
+
+      Object.keys(devices).forEach(function (key) {
+        const device = devices[key];
+        const row = document.querySelector('tr[data-device-id="' + key + '"]');
+        if (!row) { return; }
+        const statusBadge = row.querySelector('.js-device-status');
+        if (statusBadge) {
+          statusBadge.className = 'badge text-white ' + (device.status === 'ONLINE' ? 'text-bg-success' : 'text-bg-danger');
+          statusBadge.textContent = device.status;
+        }
+        const latencyCell = row.querySelector('.js-device-latency');
+        if (latencyCell) {
+          latencyCell.textContent = device.latency_ms == null ? '\u2014' : device.latency_ms + ' ms';
+        }
+        const trafficCell = row.querySelector('.js-device-traffic');
+        if (trafficCell) {
+          const down = device.download_mbps == null ? '\u2014' : fmt(device.download_mbps) + ' Mbps';
+          const up = device.upload_mbps == null ? '\u2014' : fmt(device.upload_mbps) + ' Mbps';
+          trafficCell.textContent = '\u2193 ' + down + ' / \u2191 ' + up;
+        }
+        const lastSeenCell = row.querySelector('.js-device-last-seen');
+        if (lastSeenCell) {
+          lastSeenCell.textContent = device.last_seen || '\u2014';
+        }
+      });
     }
 
     const stored = window.localStorage.getItem(STORAGE_KEY);
