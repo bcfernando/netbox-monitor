@@ -328,6 +328,12 @@
           {% endfor %}
         </select>
       </form>
+      <form method="post" action="{% url 'plugins:netbox_monitor:topology_sync_cables' %}" class="mb-0">
+        {% csrf_token %}
+        <button type="submit" class="btn btn-sm btn-outline-primary">
+          🔗 {% trans "Gravar Cabos LLDP" %}
+        </button>
+      </form>
       <a href="{% url 'plugins:netbox_monitor:monitor' %}" class="btn btn-sm btn-outline-secondary">
         <i class="mdi mdi-arrow-left"></i> {% trans "Painel NOC" %}
       </a>

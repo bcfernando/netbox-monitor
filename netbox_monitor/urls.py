@@ -6,6 +6,7 @@ urlpatterns = [
     path('', views.MonitorView.as_view(), name='monitor'),
     path('settings/', views.MonitorSettingsView.as_view(), name='settings'),
     path('topology/', views.TopologyView.as_view(), name='topology'),
+    path('topology/sync-cables/', views.SyncLldpCablesView.as_view(), name='topology_sync_cables'),
     path('collect-all/', views.CollectAllView.as_view(), name='collect_all'),
     path('export/csv/', views.ExportNocCsvView.as_view(), name='export_csv'),
     path('devices/<int:pk>/collect/', views.CollectNowView.as_view(), name='device_collect'),

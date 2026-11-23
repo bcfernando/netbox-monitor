@@ -88,6 +88,8 @@ SNMP_TIMEOUT = 2
 SNMP_RETRIES = 0
 SNMP_TOTAL_TIMEOUT = 20
 PING_TIMEOUT = 1
+PING_COUNT = 3
+PING_INTERVAL = 0.15
 COLLECT_MAX_WORKERS = 16
 SNMP_MAX_INTERFACES = 64
 SNMP_MAX_PROCESSORS = 256
@@ -1057,14 +1059,28 @@ def collect_device(ip, community='public'):
         'ping_error': None,
         'snmp_error': None,
     }
+    hardware_metrics = {'ping_quality': {'packet_loss': 0.0, 'jitter_ms': 0.0}}
 
     try:
-        host = icmplib.ping(str(ip), count=1, timeout=PING_TIMEOUT, privileged=False)
+        host = icmplib.ping(
+            str(ip),
+            count=PING_COUNT,
+            interval=PING_INTERVAL,
+            timeout=PING_TIMEOUT,
+            privileged=False,
+        )
         data['is_online'] = host.is_alive
+        hardware_metrics['ping_quality'] = {
+            'packet_loss': round(float(host.packet_loss or 0.0) * 100, 2),
+            'jitter_ms': round(float(host.jitter or 0.0), 3),
+        }
         if host.is_alive and host.avg_rtt is not None:
             data['latency_ms'] = round(host.avg_rtt, 2)
     except Exception as exc:
         data['ping_error'] = str(exc)
+        hardware_metrics['ping_quality'] = {'packet_loss': 100.0, 'jitter_ms': 0.0}
+
+    data['hardware_metrics'] = hardware_metrics
 
     if data['is_online']:
         try:
@@ -1077,8 +1093,14 @@ def collect_device(ip, community='public'):
                 'interfaces_summary': snmp_data.get('interfaces_summary', []),
                 'vlans_summary': snmp_data.get('vlans_summary', []),
                 'loop_status': snmp_data.get('loop_status', {}),
-                'hardware_metrics': snmp_data.get('hardware_metrics', {}),
             })
+            snmp_hardware = snmp_data.get('hardware_metrics') or {}
+            if isinstance(snmp_hardware, dict):
+                snmp_hardware.pop('ping_quality', None)
+            data['hardware_metrics'] = {
+                **snmp_hardware,
+                'ping_quality': hardware_metrics['ping_quality'],
+            }
         except Exception as exc:
             data['snmp_error'] = str(exc)
 
@@ -1371,20 +1393,34 @@ class DeviceMonitorJob(JobRunner):
 def _ping_only(ip):
     import icmplib
 
+    def _result(is_alive, latency_ms, packet_loss, jitter_ms):
+        return {
+            'is_online': is_alive,
+            'latency_ms': latency_ms,
+            'packet_loss': packet_loss,
+            'jitter_ms': jitter_ms,
+        }
+
     try:
         host = icmplib.ping(
-            str(ip), count=1, timeout=PING_TIMEOUT, privileged=False
+            str(ip),
+            count=PING_COUNT,
+            interval=PING_INTERVAL,
+            timeout=PING_TIMEOUT,
+            privileged=False,
         )
-        if not host.is_alive:
-            return False, None
-        latency = round(host.avg_rtt, 2) if host.avg_rtt is not None else None
-        return True, latency
+        return _result(
+            host.is_alive,
+            round(host.avg_rtt, 2) if host.is_alive and host.avg_rtt is not None else None,
+            round(float(host.packet_loss or 0.0) * 100, 2),
+            round(float(host.jitter or 0.0), 3),
+        )
     except Exception:
-        return False, None
+        return _result(False, None, 100.0, 0.0)
 
 
 def run_fast_ping_cycle():
-    """Pinga todos os dispositivos e atualiza apenas status/latência.
+    """Pinga todos os dispositivos e atualiza status, latência, perda e jitter.
 
     A métrica mais recente de cada dispositivo é atualizada no lugar, de modo
     que os últimos dados SNMP (portas, tráfego, VLANs, hardware) permanecem
@@ -1423,7 +1459,12 @@ def run_fast_ping_cycle():
             try:
                 results[device.pk] = future.result()
             except Exception:
-                results[device.pk] = (False, None)
+                results[device.pk] = {
+                    'is_online': False,
+                    'latency_ms': None,
+                    'packet_loss': 100.0,
+                    'jitter_ms': 0.0,
+                }
 
     device_ids = [device.pk for device, _ in targets]
     latest = {}
@@ -1440,7 +1481,16 @@ def run_fast_ping_cycle():
     online_count = 0
 
     for device, ip in targets:
-        is_online, latency_ms = results.get(device.pk, (False, None))
+        result = results.get(device.pk) or {
+            'is_online': False,
+            'latency_ms': None,
+            'packet_loss': 100.0,
+            'jitter_ms': 0.0,
+        }
+        is_online = bool(result.get('is_online'))
+        latency_ms = result.get('latency_ms')
+        packet_loss = result.get('packet_loss')
+        jitter_ms = result.get('jitter_ms')
         if is_online:
             online_count += 1
 
@@ -1454,7 +1504,12 @@ def run_fast_ping_cycle():
                     interfaces_summary=[],
                     vlans_summary=[],
                     loop_status={},
-                    hardware_metrics={},
+                    hardware_metrics={
+                        'ping_quality': {
+                            'packet_loss': float(packet_loss or 0.0),
+                            'jitter_ms': float(jitter_ms or 0.0),
+                        }
+                    },
                 )
             )
             continue
@@ -1474,12 +1529,21 @@ def run_fast_ping_cycle():
 
         metric.is_online = is_online
         metric.latency_ms = latency_ms
+        metric.hardware_metrics = {
+            **(metric.hardware_metrics or {}),
+            'ping_quality': {
+                'packet_loss': float(packet_loss or 0.0),
+                'jitter_ms': float(jitter_ms or 0.0),
+            },
+        }
         to_update.append(metric)
 
     if to_create:
         DeviceMetric.objects.bulk_create(to_create)
     if to_update:
-        DeviceMetric.objects.bulk_update(to_update, ['is_online', 'latency_ms'])
+        DeviceMetric.objects.bulk_update(
+            to_update, ['is_online', 'latency_ms', 'hardware_metrics']
+        )
 
     return {
         'checked': len(targets),

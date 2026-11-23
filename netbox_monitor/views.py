@@ -1,4 +1,5 @@
 import csv
+import logging
 import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,7 +19,7 @@ from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
 from django.views import View
 
-from dcim.models import CableTermination, Device, Interface
+from dcim.models import Cable, CableTermination, Device, Interface
 from ipam.models import VLAN
 from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
@@ -32,6 +33,8 @@ from .jobs import (
     start_fast_ping_daemon,
 )
 from .models import DeviceMetric, MonitorSettings
+
+logger = logging.getLogger(__name__)
 
 _VIRTUAL_INTERFACE_RE = re.compile(
     r'(?:^|[^a-z])(?:loopback|lo|vlan|null|mgmt|trk|port-channel)\d*(?:[^a-z]|$)',
@@ -306,6 +309,24 @@ def _port_number(name, fallback):
     return str(fallback)
 
 
+def _lookup_interface(device, port_name):
+    name = str(port_name or '').strip()
+    if not name:
+        return None
+    interface = Interface.objects.filter(device=device, name__iexact=name).first()
+    if interface is not None:
+        return interface
+    normalized = re.sub(r'[^a-z0-9]', '', name.lower())
+    if not normalized:
+        return None
+    interfaces = Interface.objects.filter(device=device).values_list('id', 'name')
+    for interface_id, iface_name in interfaces:
+        candidate = re.sub(r'[^a-z0-9]', '', str(iface_name or '').lower())
+        if candidate == normalized:
+            return Interface.objects.get(pk=interface_id)
+    return None
+
+
 def _sync_interface_type(port_name):
     name = (port_name or '').strip()
     if _SYNC_SFP_INTERFACE_RE.search(name):
@@ -362,6 +383,17 @@ def _to_float(value):
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _ping_quality_from_metric(metric):
+    if metric is None or not isinstance(metric.hardware_metrics, dict):
+        return None, None
+    ping_quality = metric.hardware_metrics.get('ping_quality')
+    if not isinstance(ping_quality, dict):
+        return None, None
+    packet_loss = _to_float(ping_quality.get('packet_loss'))
+    jitter_ms = _to_float(ping_quality.get('jitter_ms'))
+    return packet_loss, jitter_ms
 
 
 def _poe_summary(hardware_metrics):
@@ -644,6 +676,14 @@ def _sla_badge_class(sla_percent):
     return 'text-bg-danger'
 
 
+def _ping_loss_badge_class(packet_loss):
+    if packet_loss is None:
+        return 'text-bg-secondary'
+    if packet_loss > 0:
+        return 'text-bg-danger'
+    return 'text-bg-success'
+
+
 def _monitored_devices(request):
     return list(
         Device.objects.restrict(request.user, 'view')
@@ -732,6 +772,8 @@ def _build_noc_rows(devices):
 
         loop_alert = _loop_flag(metric)
 
+        packet_loss, jitter_ms = _ping_quality_from_metric(metric)
+
         rows.append({
             'device': device,
             'ip': str(device.primary_ip.address).split('/')[0] if device.primary_ip else '',
@@ -740,6 +782,11 @@ def _build_noc_rows(devices):
             'is_online': bool(metric and metric.is_online),
             'has_latency': bool(metric and metric.latency_ms is not None),
             'latency_ms': metric.latency_ms if metric else None,
+            'packet_loss': packet_loss,
+            'has_packet_loss': packet_loss is not None,
+            'packet_loss_badge_class': _ping_loss_badge_class(packet_loss),
+            'jitter_ms': jitter_ms,
+            'has_jitter': jitter_ms is not None,
             'uptime': _format_uptime(metric),
             'active_ports': sum(
                 1 for row in physical_rows
@@ -953,6 +1000,7 @@ class DeviceMonitorView(generic.ObjectView):
         poe = _poe_summary(hardware_metrics)
         interface_rows = _annotate_poe(interface_rows, hardware_metrics)
         interface_rows = _annotate_neighbors(interface_rows, hardware_metrics)
+        ping_packet_loss, ping_jitter_ms = _ping_quality_from_metric(latest)
 
         temperatures = []
         for item in hardware_metrics.get('temperatures', []) or []:
@@ -991,6 +1039,8 @@ class DeviceMonitorView(generic.ObjectView):
         return {
             'latest_metric': latest,
             'has_latency': latest is not None and latest.latency_ms is not None,
+            'ping_packet_loss': ping_packet_loss,
+            'ping_jitter_ms': ping_jitter_ms,
             'range_key': range_key,
             'range_label': range_label,
             'range_options': [
@@ -1187,6 +1237,74 @@ class SyncSnmpToNetboxView(LoginRequiredMixin, View):
             ),
         )
         return redirect(redirect_url)
+
+
+class SyncLldpCablesView(LoginRequiredMixin, View):
+    http_method_names = ['post']
+
+    def post(self, request):
+        devices = _monitored_devices(request)
+        devices_by_name = {}
+        for device in devices:
+            devices_by_name[str(device.name or '').strip().lower()] = device
+
+        created_cables = 0
+        processed_pairs = set()
+
+        for device in devices:
+            metric = (
+                DeviceMetric.objects.filter(device=device)
+                .order_by('-timestamp')
+                .first()
+            )
+            if metric is None or not isinstance(metric.hardware_metrics, dict):
+                continue
+            neighbors = metric.hardware_metrics.get('neighbors')
+            if not isinstance(neighbors, list):
+                continue
+
+            for neighbor in neighbors:
+                if not isinstance(neighbor, dict):
+                    continue
+                remote_name = str(neighbor.get('remote_device') or '').strip()
+                if not remote_name:
+                    continue
+                device_b = devices_by_name.get(remote_name.lower())
+                if device_b is None or device_b.pk == device.pk:
+                    continue
+                pair_key = tuple(sorted((device.pk, device_b.pk)))
+                if pair_key in processed_pairs:
+                    continue
+                processed_pairs.add(pair_key)
+
+                iface_a = _lookup_interface(device, neighbor.get('local_port'))
+                iface_b = _lookup_interface(device_b, neighbor.get('remote_port'))
+                if iface_a is None or iface_b is None:
+                    continue
+                if iface_a.cable is not None or iface_b.cable is not None:
+                    continue
+
+                try:
+                    cable = Cable()
+                    cable.a_terminations = [iface_a]
+                    cable.b_terminations = [iface_b]
+                    cable.save()
+                    created_cables += 1
+                except Exception as exc:
+                    logger.warning(
+                        'Falha ao gravar cabo LLDP %s <-> %s: %s',
+                        iface_a.name,
+                        iface_b.name,
+                        exc,
+                    )
+
+        messages.success(
+            request,
+            _('Sincronização de cabos LLDP concluída: {count} cabo(s) novo(s) criado(s).').format(
+                count=created_cables,
+            ),
+        )
+        return redirect('plugins:netbox_monitor:topology')
 
 
 class CollectAllView(LoginRequiredMixin, View):
@@ -1638,6 +1756,8 @@ class LiveMetricsApiView(LoginRequiredMixin, View):
                 'status': row['status'],
                 'has_metric': metric is not None,
                 'latency_ms': row['latency_ms'],
+                'packet_loss': row['packet_loss'],
+                'jitter_ms': row['jitter_ms'],
                 'download_mbps': row['download_mbps'],
                 'upload_mbps': row['upload_mbps'],
                 'traffic_total_mbps': row['traffic_total'],

@@ -9,16 +9,36 @@ integrados à interface do NetBox — sem precisar de Zabbix, Grafana ou Prometh
 
 ## Recursos
 
-- **Ping ICMP** por dispositivo, com latência (RTT) e status online/offline.
-- **SNMPv1/v2c** para coleta de `sysDescr`, uptime, CPU e memória.
+- **Coleta Paralela ICMP (Latência, Jitter e Perda de Pacotes) + SNMPv1/v2c**:
+  - Ping ICMP com `count=3`, `interval=0.15s` e `timeout=1s`, calculando latência
+    média, **perda de pacotes (%)** e **jitter (ms)**, salvos em
+    `hardware_metrics['ping_quality'] = {'packet_loss': ..., 'jitter_ms': ...}`.
+  - SNMPv1/v2c para coleta de `sysDescr`, uptime, CPU, memória, interfaces, VLANs,
+    PoE, sensores de hardware, LLDP/CDP e loop STP.
+  - Coleta paralela em lote (até 16 workers) e coleta sob demanda por dispositivo.
 - **Cálculo de banda em Mbps** por interface, a partir dos contadores
   `ifHCInOctets` / `ifHCOutOctets` (com fallback para os contadores 32 bits).
-- **Painel frontal dinâmico por fabricante** (Aruba, HPE, Cisco, MikroTik,
+- **Painel Frontal Dinâmico por Fabricante** (Aruba, HPE, Cisco, MikroTik,
   Ubiquiti e genérico), com portas físicas 1–48 e SFPs 49–52.
-- **Detecção de loop STP** via `dot1dStpPortState` e mudanças de topologia.
-- **Mapeamento de VLANs** via `dot1qVlanStaticName` e `dot1qPvid`.
-- **Histórico de métricas** em `DeviceMetric` e gráficos de latência, CPU e memória.
-- **Jobs agendados** (`DeviceMonitorJob`, a cada 5 minutos) e coleta sob demanda.
+- **Detecção Inteligente de Loop STP** via `dot1dStpPortState` e mudanças de topologia.
+- **Mapeamento de VLANs** via `dot1qVlanStaticName` e `dot1qPvid`, além da
+  **Sincronização de Interfaces/Cabos LLDP no NetBox** (rota
+  `POST /plugins/monitor/topology/sync-cables/` com o botão "🔗 Gravar Cabos LLDP").
+- **Topologia Automática por Rack** (Modo Claro/Escuro + Exportar PDF).
+- **Modo TV NOC Ao Vivo** (estilo Centreon/Grafana sem recarregar a página).
+- **Cálculo de SLA (7d)** por dispositivo.
+- **Exportação CSV** e **Alertas via Telegram/Webhook**.
+
+### Coleta ICMP e qualidade de link
+
+A coleta ICMP utiliza três pacotes por disparo (`count=3`, `interval=0.15s`,
+`timeout=1`) e expõe no último registro de `DeviceMetric`:
+
+- `latency_ms`: latência média (RTT) em milissegundos;
+- `packet_loss`: percentual de perda de pacotes (0 a 100);
+- `jitter_ms`: jitter médio (variação) em milissegundos.
+
+A tela de dispositivos destaca a **perda** em vermelho quando `packet_loss > 0`.
 
 ## Requisitos
 
@@ -84,9 +104,20 @@ dispositivos desejados.
 ### Páginas
 
 - **Monitoramento** (`/plugins/monitor/`): visão geral de todos os dispositivos,
-  com total, online, offline e botão de coleta.
-- **Device → aba Monitoramento**: métricas, gráficos, VLANs, status STP e painel
-  frontal do switch.
+  com total, online, offline, latência, **perda de pacotes (%)** e **jitter (ms)**,
+  além do botão de coleta.
+- **Device → aba Monitoramento**: métricas, gráficos, VLANs, status STP, qualidade
+  ICMP (latência, perda e jitter) e painel frontal do switch.
+- **Topologia** (`/plugins/monitor/topology/`): topologia por LLDP/CDP com botão
+  **🔗 Gravar Cabos LLDP** (`POST /plugins/monitor/topology/sync-cables/`) que cria
+  automaticamente os `Cable` no NetBox entre dispositivos vizinhos detectados.
+- **Modo TV** (`/plugins/monitor/tv/`): dashboard NOC ao vivo estilo Centreon/Grafana
+  com gráficos, gauges e disponibilidade por minuto, atualizando sem recarregar a página.
+
+### Alertas
+
+Alertas de latência alta, offline, loop STP e queda de uplink são enviados via
+webhook (Telegram/Discord/Slack/n8n) configurado em **Settings → NetBox Monitor**.
 
 ### Painel frontal
 

@@ -10,6 +10,8 @@
       {% endif %}
       <div class="text-muted small mt-2">
         {% if has_latency %}{{ latest_metric.latency_ms }} ms · {% endif %}
+        {% if ping_packet_loss is not None %}Perda: {{ ping_packet_loss }}% · {% endif %}
+        {% if ping_jitter_ms is not None %}Jitter: {{ ping_jitter_ms }} ms · {% endif %}
         {{ latest_metric.timestamp }}
       </div>
     {% else %}

@@ -76,6 +76,8 @@
             <th>{% trans "Tráfego Total (Mbps)" %}</th>
             <th>{% trans "STP / Loop" %}</th>
             <th>{% trans "SLA (7d)" %}</th>
+            <th>{% trans "Perda (ICMP)" %}</th>
+            <th>{% trans "Jitter (ms)" %}</th>
             <th>{% trans "Última latência" %}</th>
             <th>{% trans "Última coleta" %}</th>
           </tr>
@@ -120,6 +122,14 @@
                   <span class="badge {{ row.sla_badge_class }} text-white">{{ row.sla_percent|floatformat:2 }}%</span>
                 {% else %}—{% endif %}
               </td>
+              <td class="js-device-packet-loss">
+                {% if row.has_packet_loss %}
+                  <span class="badge {{ row.packet_loss_badge_class }} text-white">{{ row.packet_loss }}%</span>
+                {% else %}—{% endif %}
+              </td>
+              <td class="js-device-jitter">
+                {% if row.has_jitter %}{{ row.jitter_ms }} ms{% else %}—{% endif %}
+              </td>
               <td class="js-device-latency">
                 {% if row.has_latency %}{{ row.metric.latency_ms }} ms{% else %}—{% endif %}
               </td>
@@ -129,7 +139,7 @@
             </tr>
           {% empty %}
             <tr>
-              <td colspan="10" class="text-center text-muted py-4">
+              <td colspan="12" class="text-center text-muted py-4">
                 {% trans "Nenhum dispositivo com IP primário encontrado." %}
               </td>
             </tr>
@@ -234,6 +244,16 @@
         const latencyCell = row.querySelector('.js-device-latency');
         if (latencyCell) {
           latencyCell.textContent = device.latency_ms == null ? '\u2014' : device.latency_ms + ' ms';
+        }
+        const lossCell = row.querySelector('.js-device-packet-loss');
+        if (lossCell) {
+          lossCell.innerHTML = device.packet_loss == null
+            ? '\u2014'
+            : '<span class="badge ' + (device.packet_loss > 0 ? 'text-bg-danger' : 'text-bg-success') + ' text-white">' + device.packet_loss + '%</span>';
+        }
+        const jitterCell = row.querySelector('.js-device-jitter');
+        if (jitterCell) {
+          jitterCell.textContent = device.jitter_ms == null ? '\u2014' : device.jitter_ms + ' ms';
         }
         const trafficCell = row.querySelector('.js-device-traffic');
         if (trafficCell) {
