@@ -72,6 +72,19 @@ tr:hover td{background:#ffffff08}
 @media(max-width:560px){.s2,.s3,.s4{grid-column:span 12}}
 #noc-alert{display:none;align-items:center;gap:8px;width:fit-content;max-width:calc(100% - 28px);margin:6px 0 8px 14px;padding:5px 12px;border-radius:6px;background:rgba(242,73,92,.14);border:1px solid rgba(242,73,92,.45);color:#ff8593;font-size:12px;font-weight:600;line-height:1.3;position:relative;left:auto;top:auto;transform:none;z-index:2}
 #noc-alert.on{display:inline-flex}
+
+#editbar{display:none;align-items:center;flex-wrap:wrap;gap:8px;margin:8px 14px;padding:10px 14px;border-radius:8px;background:rgba(87,148,242,.08);border:1px solid rgba(87,148,242,.35);font-size:12px}
+#editbar.on{display:flex}
+#editbar .wt{font-weight:600;color:#5794f2;margin-right:4px}
+#wlist{display:flex;flex-wrap:wrap;gap:6px;flex:1}
+.wchip{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:5px;background:rgba(128,128,128,.12);border:1px solid rgba(128,128,128,.25);cursor:pointer;user-select:none}
+.wchip input{margin:0;cursor:pointer}
+.p-tools{display:none;float:right;gap:4px;align-items:center}
+body.noc-editing .p{outline:1px dashed rgba(87,148,242,.65);cursor:grab}
+body.noc-editing .p.drag-over{outline:2px solid #5794f2;background:rgba(87,148,242,.06)}
+body.noc-editing .p-tools{display:inline-flex}
+.pt-btn{background:rgba(128,128,128,.18);border:1px solid rgba(128,128,128,.3);color:inherit;border-radius:4px;padding:1px 6px;font-size:11px;cursor:pointer;line-height:1.4}
+.pt-btn:hover{background:rgba(87,148,242,.25);border-color:#5794f2}
 </style>
 </head>
 <body>
@@ -94,11 +107,17 @@ tr:hover td{background:#ffffff08}
     <option value="360"{% if selected_range == '360' %} selected{% endif %}>Últimas 6 horas</option>
   </select></label>
   <button class="btn" id="sound-toggle" type="button" aria-pressed="false">🔔 Som: OFF</button>
+  <button class="btn" id="layout-toggle" type="button" aria-pressed="false">⚙️ Personalizar</button>
   <button class="btn" id="go" type="button">Atualizar</button>
   <button class="btn" id="tv-fullscreen-btn" type="button">Tela Cheia (F11)</button>
   <a class="btn" href="{% url 'plugins:netbox_monitor:monitor' %}">Voltar ao NetBox</a>
 </header>
 <div class="noc-alert" id="noc-alert" role="alert" aria-live="assertive"></div>
+<div id="editbar">
+  <span class="wt">⚙️ Layout NOC:</span>
+  <div id="wlist"></div>
+  <button class="btn" id="layout-reset" type="button">Restaurar Padrão</button>
+</div>
 <main id="m"></main>
 <div class="tip" id="tip"></div>
 
@@ -268,14 +287,147 @@ var LAY=[
  ["Alertas","dispositivos · incidentes",[
   ["s12 h3","Dispositivos monitorados","tbl","dev"],["s6 h3","Top dispositivos","tbl","top"],["s6 h3","Log de incidentes (24h)","tbl","log"]]]
 ];
-var m=document.getElementById("m"),html="";
-LAY.forEach(function(r,ri){html+='<div class="row" data-r="'+ri+'"><span class="ar">▾</span>'+r[0]+' <b>'+r[1]+'</b></div>';
-  r[2].forEach(function(p){var id="p"+p[3];html+='<section class="p '+p[0]+' r'+ri+'"><h2>'+p[1]+'<em></em></h2><div class="b">'+
-   (p[2]=="stat"?'<div class="stat"><svg id="sp'+p[3]+'"></svg><div class="v1" id="'+id+'"></div><div class="l">'+p[1]+'</div></div>':
-    p[2]=="gauge"||p[2]=="donut"||p[2]=="bars"||p[2]=="heat"||p[2]=="tl"?'<svg id="'+id+'"></svg>':
-    p[2]=="line"?'<svg style="height:calc(100% - 22px)" id="'+id+'"></svg><div class="leg" id="l'+p[3]+'"></div>':
-    p[2]=="bgauge"?'<div class="bg" id="'+id+'"></div>':'<div class="sc"><table id="'+id+'"></table></div>')+'</div></section>'})});
-m.innerHTML=html;
+var LAYOUT_KEY="netbox_noc_grafana_layout_v1";
+var SPAN_CYCLE=["s2","s3","s4","s6","s8","s12"];
+var ALL_WIDGETS=[];
+LAY.forEach(function(r,ri){
+  r[2].forEach(function(p){
+    var mSpan=(p[0].match(/s\d+/)||["s4"])[0];
+    var mH=(p[0].match(/h\d+|auto/)||["h2"])[0];
+    ALL_WIDGETS.push({id:p[3],title:p[1],type:p[2],span:mSpan,h:mH,row:ri,rowTitle:r[0],rowSub:r[1]});
+  });
+});
+
+function loadSavedLayout(){
+  try{return JSON.parse(localStorage.getItem(LAYOUT_KEY)||"null")}catch(e){return null}
+}
+function saveLayoutState(st){
+  try{localStorage.setItem(LAYOUT_KEY,JSON.stringify(st))}catch(e){}
+}
+function getOrderedWidgets(){
+  var st=loadSavedLayout()||{};
+  var order=Array.isArray(st.order)?st.order:[];
+  var hidden=st.hidden||{};
+  var spans=st.spans||{};
+  var byId={};
+  ALL_WIDGETS.forEach(function(w){byId[w.id]=Object.assign({},w,{
+    hidden:clearhidden[w.id],
+    span:spans[w.id]||w.span
+  })});
+  var list=[];
+  order.forEach(function(id){if(byId[id]){list.push(byId[id]);delete byId[id]}});
+  ALL_WIDGETS.forEach(function(w){if(byId[w.id])list.push(byId[w.id])});
+  return list;
+}
+
+function buildDashboardGrid(){
+  var m=document.getElementById("m"),html="";
+  var widgets=getOrderedWidgets();
+  var isCustom=clearloadSavedLayout();
+  var lastRow=-1;
+  widgets.forEach(function(w){
+    if(w.hidden)return;
+      lastRow=w.row;
+      html+='<div class="row" data-r="'+w.row+'"><span class="ar">▾</span>'+w.rowTitle+' <b>'+w.rowSub+'</b></div>';
+    }
+    var id="p"+w.id;
+    var tools='<span class="p-tools"><button type="button" class="pt-btn" data-act="span" data-wid="'+w.id+'" title="Alterar largura ('+w.span+')">↔ '+w.span.replace("s","")+'c</button><button type="button" class="pt-btn" data-act="hide" data-wid="'+w.id+'" title="Ocultar painel">✕</button></span>';
+    html+='<section class="p '+w.span+' '+w.h+' r'+w.row+'" data-wid="'+w.id+'" draggable="false"><h2>'+w.title+tools+'<em></em></h2><div class="b">'+
+     (w.type=="stat"?'<div class="stat"><svg id="sp'+w.id+'"></svg><div class="v1" id="'+id+'"></div><div class="l">'+w.title+'</div></div>':
+      w.type=="gauge"||w.type=="donut"||w.type=="bars"||w.type=="heat"||w.type=="tl"?'<svg id="'+id+'"></svg>':
+      w.type=="line"?'<svg style="height:calc(100% - 22px)" id="'+id+'"></svg><div class="leg" id="l'+w.id+'"></div>':
+      w.type=="bgauge"?'<div class="bg" id="'+id+'"></div>':'<div class="sc"><table id="'+id+'"></table></div>')+'</div></section>';
+  });
+  m.innerHTML=html;
+  bindWidgetInteractions();
+}
+
+function renderEditDrawer(){
+  var wlist=document.getElementById("wlist");
+  var widgets=getOrderedWidgets();
+  wlist.innerHTML=widgets.map(function(w){
+    return'<label class="wchip"><input type="checkbox" data-toggle-wid="'+w.id+'"'+(w.hidden?'':' checked')+'>'+esc(w.title)+'</label>';
+  }).join("");
+  wlist.querySelectorAll("input[data-toggle-wid]").forEach(function(cb){
+    cb.onchange=function(){
+      var wid=this.getAttribute("data-toggle-wid");
+      var st=loadSavedLayout()||{order:getOrderedWidgets().map(function(x){return x.id}),hidden:{},spans:{}};
+      st.hidden=st.hidden||{};
+      saveLayoutState(st);
+      buildDashboardGrid();
+      render();
+    };
+  });
+}
+
+var dragSrcWid=null;
+function bindWidgetInteractions(){
+  var editing=document.body.classList.contains("noc-editing");
+  document.querySelectorAll("#m section.p[data-wid]").forEach(function(sec){
+    sec.setAttribute("draggable",editing?"true":"false");
+    sec.ondragstart=function(e){
+      dragSrcWid=this.getAttribute("data-wid");
+      e.dataTransfer.effectAllowed="move";
+    };
+    sec.ondragover=function(e){
+      e.preventDefault();
+      this.classList.add("drag-over");
+    };
+    sec.ondragleave=function(){this.classList.remove("drag-over")};
+    sec.ondrop=function(e){
+      e.preventDefault();
+      this.classList.remove("drag-over");
+      var targetWid=this.getAttribute("data-wid");
+      var curOrder=getOrderedWidgets().map(function(x){return x.id});
+      var fromIdx=curOrder.indexOf(dragSrcWid),toIdx=curOrder.indexOf(targetWid);
+      if(fromIdx>-1&&toIdx>-1){
+        curOrder.splice(fromIdx,1);
+        curOrder.splice(toIdx,0,dragSrcWid);
+        var st=loadSavedLayout()||{hidden:{},spans:{}};
+        st.order=curOrder;
+        saveLayoutState(st);
+        buildDashboardGrid();
+        renderEditDrawer();
+        render();
+      }
+      dragSrcWid=null;
+    };
+  });
+  document.querySelectorAll(".pt-btn[data-act]").forEach(function(btn){
+    btn.onclick=function(e){
+      e.stopPropagation();
+      var wid=this.getAttribute("data-wid"),act=this.getAttribute("data-act");
+      var st=loadSavedLayout()||{order:getOrderedWidgets().map(function(x){return x.id}),hidden:{},spans:{}};
+      st.hidden=st.hidden||{};st.spans=st.spans||{};
+      if(act==="hide"){st.hidden[wid]=true}
+      else if(act==="span"){
+        var curW=getOrderedWidgets().filter(function(x){return x.id===wid})[0];
+        var idx=SPAN_CYCLE.indexOf(curW?curW.span:"s4");
+        st.spans[wid]=SPAN_CYCLE[(idx+1)%SPAN_CYCLE.length];
+      }
+      saveLayoutState(st);
+      buildDashboardGrid();
+      renderEditDrawer();
+      render();
+    };
+  });
+}
+
+document.getElementById("layout-toggle").onclick=function(){
+  var on=document.body.classList.toggle("noc-editing");
+  this.setAttribute("aria-pressed",on?"true":"false");
+  document.getElementById("editbar").classList.toggle("on",on);
+  renderEditDrawer();
+  bindWidgetInteractions();
+};
+document.getElementById("layout-reset").onclick=function(){
+  localStorage.removeItem(LAYOUT_KEY);
+  buildDashboardGrid();
+  renderEditDrawer();
+  render();
+};
+
+buildDashboardGrid();
 
 /* ================= RENDER ================= */
 function stat(id,value,color){var el=document.getElementById("p"+id);if(!el)return;el.textContent=value;el.style.color=color}
