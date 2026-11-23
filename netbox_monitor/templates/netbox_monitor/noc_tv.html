@@ -85,6 +85,19 @@ body.noc-editing .p.drag-over{outline:2px solid #5794f2;background:rgba(87,148,2
 body.noc-editing .p-tools{display:inline-flex}
 .pt-btn{background:rgba(128,128,128,.18);border:1px solid rgba(128,128,128,.3);color:inherit;border-radius:4px;padding:1px 6px;font-size:11px;cursor:pointer;line-height:1.4}
 .pt-btn:hover{background:rgba(87,148,242,.25);border-color:#5794f2}
+
+#editbar{display:none;align-items:center;flex-wrap:wrap;gap:8px;margin:8px 14px;padding:10px 14px;border-radius:8px;background:rgba(87,148,242,.08);border:1px solid rgba(87,148,242,.35);font-size:12px}
+#editbar.on{display:flex}
+#editbar .wt{font-weight:600;color:#5794f2;margin-right:4px}
+#wlist{display:flex;flex-wrap:wrap;gap:6px;flex:1}
+.wchip{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:5px;background:rgba(128,128,128,.12);border:1px solid rgba(128,128,128,.25);cursor:pointer;user-select:none}
+.wchip input{margin:0;cursor:pointer}
+.p-tools{display:none;float:right;gap:4px;align-items:center}
+body.noc-editing .p{outline:1px dashed rgba(87,148,242,.65);cursor:grab}
+body.noc-editing .p.drag-over{outline:2px solid #5794f2;background:rgba(87,148,242,.06)}
+body.noc-editing .p-tools{display:inline-flex}
+.pt-btn{background:rgba(128,128,128,.18);border:1px solid rgba(128,128,128,.3);color:inherit;border-radius:4px;padding:1px 6px;font-size:11px;cursor:pointer;line-height:1.4}
+.pt-btn:hover{background:rgba(87,148,242,.25);border-color:#5794f2}
 </style>
 </head>
 <body>
@@ -108,11 +121,17 @@ body.noc-editing .p-tools{display:inline-flex}
   </select></label>
   <button class="btn" id="sound-toggle" type="button" aria-pressed="false">🔔 Som: OFF</button>
   <button class="btn" id="layout-toggle" type="button" aria-pressed="false">⚙️ Personalizar</button>
+  <button class="btn" id="layout-toggle" type="button" aria-pressed="false">⚙️ Personalizar</button>
   <button class="btn" id="go" type="button">Atualizar</button>
   <button class="btn" id="tv-fullscreen-btn" type="button">Tela Cheia (F11)</button>
   <a class="btn" href="{% url 'plugins:netbox_monitor:monitor' %}">Voltar ao NetBox</a>
 </header>
 <div class="noc-alert" id="noc-alert" role="alert" aria-live="assertive"></div>
+<div id="editbar">
+  <span class="wt">⚙️ Layout NOC:</span>
+  <div id="wlist"></div>
+  <button class="btn" id="layout-reset" type="button">Restaurar Padrão</button>
+</div>
 <div id="editbar">
   <span class="wt">⚙️ Layout NOC:</span>
   <div id="wlist"></div>
@@ -321,6 +340,42 @@ function getOrderedWidgets(){
 }
 
 function buildDashboardGrid(){
+  var LAYOUT_KEY="netbox_noc_grafana_layout_v1";
+var SPAN_CYCLE=["s2","s3","s4","s6","s8","s12"];
+var ALL_WIDGETS=[];
+LAY.forEach(function(r,ri){
+  var rTitle=r.at(0),rSub=r.at(1),items=r.at(2)||[];
+  items.forEach(function(p){
+    var cls=String(p.at(0)||"s4 h2"),wTitle=p.at(1),wType=p.at(2),wId=p.at(3);
+    var mSpan=(cls.match(/s\d+/)||["s4"]).at(0);
+    var mH=(cls.match(/h\d+|auto/)||["h2"]).at(0);
+    ALL_WIDGETS.push({id:wId,title:wTitle,type:wType,span:mSpan,h:mH,row:ri,rowTitle:rTitle,rowSub:rSub});
+  });
+});
+
+function loadSavedLayout(){
+  try{return JSON.parse(localStorage.getItem(LAYOUT_KEY)||"null")}catch(e){return null}
+}
+function saveLayoutState(st){
+  try{localStorage.setItem(LAYOUT_KEY,JSON.stringify(st))}catch(e){}
+}
+function getOrderedWidgets(){
+  var st=loadSavedLayout()||{};
+  var order=Array.isArray(st.order)?st.order:[];
+  var hidden=st.hidden||{};
+  var spans=st.spans||{};
+  var byId={};
+  ALL_WIDGETS.forEach(function(w){byId[w.id]=Object.assign({},w,{
+    hidden:clearhidden[w.id],
+    span:spans[w.id]||w.span
+  })});
+  var list=[];
+  order.forEach(function(id){if(byId[id]){list.push(byId[id]);delete byId[id]}});
+  ALL_WIDGETS.forEach(function(w){if(byId[w.id])list.push(byId[w.id])});
+  return list;
+}
+
+function buildDashboardGrid(){
   var m=document.getElementById("m"),html="";
   var widgets=getOrderedWidgets();
   var isCustom=clearloadSavedLayout();
@@ -331,7 +386,7 @@ function buildDashboardGrid(){
       html+='<div class="row" data-r="'+w.row+'"><span class="ar">▾</span>'+w.rowTitle+' <b>'+w.rowSub+'</b></div>';
     }
     var id="p"+w.id;
-    var tools='<span class="p-tools"><button type="button" class="pt-btn" data-act="span" data-wid="'+w.id+'" title="Alterar largura ('+w.span+')">↔ '+w.span.replace("s","")+'c</button><button type="button" class="pt-btn" data-act="hide" data-wid="'+w.id+'" title="Ocultar painel">✕</button></span>';
+    var tools='<span class="p-tools"><button type="button" class="pt-btn" data-act="span" data-wid="'+w.id+'" title="Alterar largura">↔ '+w.span.replace("s","")+'c</button><button type="button" class="pt-btn" data-act="hide" data-wid="'+w.id+'" title="Ocultar painel">✕</button></span>';
     html+='<section class="p '+w.span+' '+w.h+' r'+w.row+'" data-wid="'+w.id+'" draggable="false"><h2>'+w.title+tools+'<em></em></h2><div class="b">'+
      (w.type=="stat"?'<div class="stat"><svg id="sp'+w.id+'"></svg><div class="v1" id="'+id+'"></div><div class="l">'+w.title+'</div></div>':
       w.type=="gauge"||w.type=="donut"||w.type=="bars"||w.type=="heat"||w.type=="tl"?'<svg id="'+id+'"></svg>':
@@ -339,6 +394,95 @@ function buildDashboardGrid(){
       w.type=="bgauge"?'<div class="bg" id="'+id+'"></div>':'<div class="sc"><table id="'+id+'"></table></div>')+'</div></section>';
   });
   m.innerHTML=html;
+  bindWidgetInteractions();
+}
+
+function renderEditDrawer(){
+  var wlist=document.getElementById("wlist");
+  var widgets=getOrderedWidgets();
+  wlist.innerHTML=widgets.map(function(w){
+    return'<label class="wchip"><input type="checkbox" data-toggle-wid="'+w.id+'"'+(w.hidden?'':' checked')+'>'+esc(w.title)+'</label>';
+  }).join("");
+  wlist.querySelectorAll("input").forEach(function(cb){
+    cb.onchange=function(){
+      var wid=this.getAttribute("data-toggle-wid");
+      var st=loadSavedLayout()||{order:getOrderedWidgets().map(function(x){return x.id}),hidden:{},spans:{}};
+      st.hidden=st.hidden||{};
+      saveLayoutState(st);
+      buildDashboardGrid();
+      render();
+    };
+  });
+}
+
+var dragSrcWid=null;
+function bindWidgetInteractions(){
+  var editing=document.body.classList.contains("noc-editing");
+  document.querySelectorAll("#m section.p").forEach(function(sec){
+    sec.setAttribute("draggable",editing?"true":"false");
+    sec.ondragstart=function(e){
+      dragSrcWid=this.getAttribute("data-wid");
+      e.dataTransfer.effectAllowed="move";
+    };
+    sec.ondragover=function(e){
+      e.preventDefault();
+      this.classList.add("drag-over");
+    };
+    sec.ondragleave=function(){this.classList.remove("drag-over")};
+    sec.ondrop=function(e){
+      e.preventDefault();
+      this.classList.remove("drag-over");
+      var targetWid=this.getAttribute("data-wid");
+      var curOrder=getOrderedWidgets().map(function(x){return x.id});
+      var fromIdx=curOrder.indexOf(dragSrcWid),toIdx=curOrder.indexOf(targetWid);
+      if(fromIdx>-1&&toIdx>-1){
+        curOrder.splice(fromIdx,1);
+        curOrder.splice(toIdx,0,dragSrcWid);
+        var st=loadSavedLayout()||{hidden:{},spans:{}};
+        st.order=curOrder;
+        saveLayoutState(st);
+        buildDashboardGrid();
+        renderEditDrawer();
+        render();
+      }
+      dragSrcWid=null;
+    };
+  });
+  document.querySelectorAll(".pt-btn").forEach(function(btn){
+    btn.onclick=function(e){
+      e.stopPropagation();
+      var wid=this.getAttribute("data-wid"),act=this.getAttribute("data-act");
+      var st=loadSavedLayout()||{order:getOrderedWidgets().map(function(x){return x.id}),hidden:{},spans:{}};
+      st.hidden=st.hidden||{};st.spans=st.spans||{};
+      if(act==="hide"){st.hidden[wid]=true}
+      else if(act==="span"){
+        var curW=getOrderedWidgets().filter(function(x){return x.id===wid}).at(0);
+        var idx=SPAN_CYCLE.indexOf(curW?curW.span:"s4");
+        st.spans[wid]=SPAN_CYCLE.at((idx+1)%SPAN_CYCLE.length);
+      }
+      saveLayoutState(st);
+      buildDashboardGrid();
+      renderEditDrawer();
+      render();
+    };
+  });
+}
+
+document.getElementById("layout-toggle").onclick=function(){
+  var on=document.body.classList.toggle("noc-editing");
+  this.setAttribute("aria-pressed",on?"true":"false");
+  document.getElementById("editbar").classList.toggle("on",on);
+  renderEditDrawer();
+  bindWidgetInteractions();
+};
+document.getElementById("layout-reset").onclick=function(){
+  localStorage.removeItem(LAYOUT_KEY);
+  buildDashboardGrid();
+  renderEditDrawer();
+  render();
+};
+
+buildDashboardGrid();
   bindWidgetInteractions();
 }
 
