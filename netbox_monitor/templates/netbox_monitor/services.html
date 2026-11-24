@@ -1,0 +1,173 @@
+{% extends 'base/layout.html' %}
+{% load form_helpers %}
+{% load i18n %}
+
+{% block content %}
+<div class="container-fluid">
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <div>
+      <h1 class="mb-0">{% trans "Serviços & SSL" %}</h1>
+      <div class="text-muted">
+        {% trans "Monitoramento HTTP/HTTPS e validade de certificados" %}
+      </div>
+    </div>
+    <div class="d-flex align-items-center gap-2">
+      <form method="post" class="mb-0">
+        {% csrf_token %}
+        <button type="submit" name="action" value="test_all" class="btn btn-primary">
+          <i class="mdi mdi-play-circle"></i> {% trans "Testar Todos Agora" %}
+        </button>
+      </form>
+      <a href="{% url 'plugins:netbox_monitor:monitor' %}" class="btn btn-sm btn-outline-secondary">
+        <i class="mdi mdi-arrow-left"></i> {% trans "Voltar" %}
+      </a>
+    </div>
+  </div>
+
+  <div class="row mb-3">
+    <div class="col-md-3">
+      <div class="card text-bg-secondary">
+        <div class="card-body">
+          <div class="fs-2 fw-bold">{{ summary.total }}</div>
+          <div>{% trans "Total de Serviços" %}</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <div class="card text-bg-success">
+        <div class="card-body">
+          <div class="fs-2 fw-bold">{{ summary.online }}</div>
+          <div>{% trans "Online" %}</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <div class="card text-bg-danger">
+        <div class="card-body">
+          <div class="fs-2 fw-bold">{{ summary.offline }}</div>
+          <div>{% trans "Offline" %}</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-md-3">
+      <div class="card text-bg-warning">
+        <div class="card-body">
+          <div class="fs-2 fw-bold">{{ summary.ssl_alert }}</div>
+          <div>{% trans "SSL vencendo (<= 15d)" %}</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card mb-3">
+    <h5 class="card-header">{% trans "Adicionar site / serviço" %}</h5>
+    <div class="card-body">
+      <form method="post" class="object-edit" data-disable-on-submit>
+        {% csrf_token %}
+        <input type="hidden" name="action" value="add">
+        {% render_form form %}
+        <div class="btn-list mt-3">
+          <button type="submit" class="btn btn-primary">
+            <i class="mdi mdi-plus"></i> {% trans "Adicionar e Testar" %}
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <div class="card">
+    <h5 class="card-header">{% trans "Serviços monitorados" %}</h5>
+    <div class="table-responsive">
+      <table class="table table-hover align-middle mb-0">
+        <thead>
+          <tr>
+            <th>{% trans "Serviço" %}</th>
+            <th>{% trans "VM" %}</th>
+            <th>{% trans "Status" %}</th>
+            <th>HTTP</th>
+            <th>{% trans "Latência" %}</th>
+            <th>SSL</th>
+            <th>{% trans "Última verificação" %}</th>
+            <th>{% trans "Erro" %}</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for service in services %}
+            <tr>
+              <td>
+                <div class="fw-bold">{{ service.name }}</div>
+                <div class="small text-muted text-break">{{ service.url }}</div>
+              </td>
+              <td>
+                {% if service.virtual_machine %}
+                  {{ service.virtual_machine }}
+                {% else %}—{% endif %}
+              </td>
+              <td>
+                <span class="badge {{ service.status_badge_class }} text-white">
+                  {{ service.last_status }}
+                </span>
+              </td>
+              <td>
+                {% if service.http_code %}<code>{{ service.http_code }}</code>{% else %}—{% endif %}
+              </td>
+              <td>
+                {% if service.response_time_ms is not None %}
+                  {{ service.response_time_ms|floatformat:0 }} ms
+                {% else %}—{% endif %}
+              </td>
+              <td>
+                {% if service.ssl_days_remaining is not None %}
+                  <span class="badge {{ service.ssl_badge }} text-white">
+                    {{ service.ssl_days_remaining }}d
+                  </span>
+                  {% if service.ssl_expires_at %}
+                    <div class="small text-muted">
+                      {{ service.ssl_expires_at|date:"d/m/Y" }}
+                    </div>
+                  {% endif %}
+                {% else %}—{% endif %}
+              </td>
+              <td>
+                {% if service.last_checked %}
+                  {{ service.last_checked|date:"d/m/Y H:i:s" }}
+                {% else %}—{% endif %}
+              </td>
+              <td class="small text-muted">
+                {{ service.last_error|default:"—"|truncatechars:60 }}
+              </td>
+              <td class="text-end">
+                <div class="d-flex gap-1 justify-content-end">
+                  <form method="post" class="mb-0">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="test">
+                    <input type="hidden" name="service_id" value="{{ service.pk }}">
+                    <button type="submit" class="btn btn-sm btn-outline-primary" title="{% trans 'Testar agora' %}">
+                      <i class="mdi mdi-play"></i>
+                    </button>
+                  </form>
+                  <form method="post" class="mb-0">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="delete">
+                    <input type="hidden" name="service_id" value="{{ service.pk }}">
+                    <button type="submit" class="btn btn-sm btn-outline-danger" title="{% trans 'Excluir' %}">
+                      <i class="mdi mdi-trash-can-outline"></i>
+                    </button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+          {% empty %}
+            <tr>
+              <td colspan="9" class="text-center text-muted py-4">
+                {% trans "Nenhum serviço cadastrado. Adicione uma URL acima." %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

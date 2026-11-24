@@ -273,6 +273,30 @@ function renderLog(rows){var el=document.getElementById("plog");
     return"<tr><td class='mono'>"+esc(r.timestamp)+"</td><td>"+pill(r.status)+"</td><td>"+esc(r.device)+"</td><td>"+esc(r.status)+"</td><td>"+esc(r.description)+"</td></tr>";
   }).join("")}
 
+function sslPill(days){
+  if(days===null||days===undefined)return'<span class="pill UNKNOWN">N/A</span>';
+  var cls=days<=0?"CRITICAL":days<=15?"WARNING":"OK";
+  return'<span class="pill '+cls+'">'+esc(days)+'d</span>'
+}
+
+function renderServices(rows){var el=document.getElementById("psvc");
+  var head='<tr><th>Serviço</th><th>Status</th><th>HTTP</th><th>Latência</th><th>SSL</th><th>VM</th></tr>';
+  if(!rows||!rows.length){el.innerHTML=head+emptyRow(6,"Nenhum serviço cadastrado.");return}
+  el.innerHTML=head+rows.map(function(r){
+    var http=(r.http_code===null||r.http_code===undefined)?"N/A":r.http_code;
+    var lat=(r.response_time_ms===null||r.response_time_ms===undefined)?"N/A":fmt(r.response_time_ms,0)+" ms";
+    var vm=r.virtual_machine?esc(r.virtual_machine):"—";
+    return"<tr><td title='"+esc(r.url)+"'>"+esc(r.name)+"</td><td>"+pill(r.status)+"</td><td class='mono'>"+http+"</td><td class='mono'>"+lat+"</td><td>"+sslPill(r.ssl_days_remaining)+"</td><td>"+vm+"</td></tr>";
+  }).join("")}
+
+function renderVMs(rows){var el=document.getElementById("pvm");
+  var head='<tr><th>Host</th><th>Cluster</th><th>IP</th><th>Status</th><th>CPU</th><th>Memória</th><th>Latência</th><th>Uptime</th></tr>';
+  if(!rows||!rows.length){el.innerHTML=head+emptyRow(8,"Nenhuma máquina virtual monitorada.");return}
+  el.innerHTML=head+rows.map(function(r){
+    var lat=(r.latency_ms===null||r.latency_ms===undefined)?"N/A":fmt(r.latency_ms,1)+" ms";
+    return"<tr><td>"+esc(r.name)+"</td><td>"+esc(r.cluster||"—")+"</td><td class='mono'>"+esc(r.ip||"N/A")+"</td><td>"+pill(r.status)+"</td><td>"+barCell(r.cpu)+"</td><td>"+barCell(r.memory)+"</td><td class='mono'>"+lat+"</td><td class='mono'>"+esc(r.uptime||"N/A")+"</td></tr>";
+  }).join("")}
+
 /* ================= LAYOUT ================= */
 var LAY=[
  ["Visão geral","status em tempo real",[
@@ -284,6 +308,10 @@ var LAY=[
   ["s6 auto","Mapa de calor — disponibilidade por coleta","heat","hm"],["s6 auto","Linha do tempo de estado","tl","tl"]]],
  ["Rede","tráfego · latência",[
   ["s8 h2","Tráfego (Mbps)","line","net"],["s4 h2","Latência média (ms)","line","ping"]]],
+ ["Serviços & SSL","HTTP · HTTPS · certificados",[
+  ["s2 h1","Serviços UP","stat","svcup"],["s2 h1","Serviços DOWN","stat","svcdown"],["s2 h1","SSL vencendo","stat","svcssl"],["s6 h3","Serviços monitorados","tbl","svc"]]],
+ ["Virtual Machines","ping · SNMP",[
+  ["s2 h1","VMs UP","stat","vmup"],["s2 h1","VMs DOWN","stat","vmdn"],["s2 h1","VMs total","stat","vmtot"],["s6 h3","Virtual Machines","tbl","vm"]]],
  ["Alertas","dispositivos · incidentes",[
   ["s12 h3","Dispositivos monitorados","tbl","dev"],["s6 h3","Top dispositivos","tbl","top"],["s6 h3","Log de incidentes (24h)","tbl","log"]]]
 ];
@@ -471,9 +499,19 @@ function render(){
   line("pnet",t.labels,netSeries);legend("lnet",netSeries);
   line("pping",t.labels,pingSeries);legend("lping",pingSeries);
 
+  var ss=d.service_summary||{},vs=d.vm_summary||{};
+  stat("svcup",ss.online||0,ss.online?C.green:C.yellow);
+  stat("svcdown",ss.offline||0,ss.offline?C.red:C.green);
+  stat("svcssl",ss.ssl_alert||0,ss.ssl_alert?C.yellow:C.green);
+  stat("vmup",vs.online||0,vs.online?C.green:C.yellow);
+  stat("vmdn",vs.offline||0,vs.offline?C.red:C.green);
+  stat("vmtot",vs.total||0,C.blue);
+
   renderDevices(d.devices);
   renderTop(d.top_devices);
   renderLog(d.incidents);
+  renderServices(d.services||[]);
+  renderVMs(d.virtual_machines||[]);
 
   document.getElementById("st").textContent="Atualizado "+d.generated_at;
 }

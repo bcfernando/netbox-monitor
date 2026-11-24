@@ -23,16 +23,24 @@ from dcim.models import Cable, CableTermination, Device, Interface
 from ipam.models import VLAN
 from netbox.views import generic
 from utilities.views import ViewTab, register_model_view
+from virtualization.models import VirtualMachine
 
-from .forms import MonitorSettingsForm
+from .forms import MonitorSettingsForm, ServiceMonitorForm
 from .jobs import (
     DeviceMonitorJob,
+    check_all_services,
+    check_service_and_save,
     collect_device,
     save_metric,
     send_webhook_alert,
     start_fast_ping_daemon,
 )
-from .models import DeviceMetric, MonitorSettings
+from .models import (
+    DeviceMetric,
+    MonitorSettings,
+    ServiceMonitor,
+    VirtualMachineMetric,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -807,6 +815,81 @@ def _build_noc_rows(devices):
     return rows
 
 
+def _monitored_virtual_machines(request):
+    return list(
+        VirtualMachine.objects.restrict(request.user, 'view')
+        .filter(Q(primary_ip4__isnull=False) | Q(primary_ip6__isnull=False))
+        .select_related('primary_ip4', 'primary_ip6', 'cluster', 'site')
+        .order_by('name')
+    )
+
+
+def _build_vm_rows(virtual_machines):
+    latest_metrics = {
+        metric.virtual_machine_id: metric
+        for metric in VirtualMachineMetric.objects.filter(
+            virtual_machine__in=virtual_machines
+        )
+        .order_by('virtual_machine_id', '-timestamp')
+        .distinct('virtual_machine_id')
+    }
+
+    rows = []
+    for virtual_machine in virtual_machines:
+        metric = latest_metrics.get(virtual_machine.pk)
+        rows.append({
+            'virtual_machine': virtual_machine,
+            'ip': (
+                str(virtual_machine.primary_ip.address).split('/')[0]
+                if virtual_machine.primary_ip else ''
+            ),
+            'cluster': (
+                getattr(virtual_machine.cluster, 'name', None) or '—'
+            ),
+            'status': (
+                'ONLINE' if metric is not None and metric.is_online
+                else 'OFFLINE' if metric is not None
+                else 'PENDING'
+            ),
+            'is_online': bool(metric is not None and metric.is_online),
+            'has_metric': metric is not None,
+            'cpu_percent': metric.cpu_percent if metric is not None else None,
+            'memory_percent': (
+                metric.memory_percent if metric is not None else None
+            ),
+            'latency_ms': metric.latency_ms if metric is not None else None,
+            'uptime': _format_uptime(metric),
+            'last_checked': metric.timestamp if metric is not None else None,
+        })
+    return rows
+
+
+def _ssl_badge_class(days):
+    if days is None:
+        return 'text-bg-secondary'
+    if days <= 0:
+        return 'text-bg-danger'
+    if days <= 15:
+        return 'text-bg-warning'
+    return 'text-bg-success'
+
+
+def _service_summary(services):
+    total = len(services)
+    online = sum(1 for service in services if service.last_status == 'ONLINE')
+    ssl_alert = sum(
+        1 for service in services
+        if service.ssl_days_remaining is not None
+        and service.ssl_days_remaining <= 15
+    )
+    return {
+        'total': total,
+        'online': online,
+        'offline': total - online,
+        'ssl_alert': ssl_alert,
+    }
+
+
 class MonitorView(View):
     def get(self, request):
         plugin_config = apps.get_app_config('netbox_monitor')
@@ -820,6 +903,13 @@ class MonitorView(View):
             timezone.now() - _INCIDENT_WINDOW,
         )
 
+        virtual_machines = _monitored_virtual_machines(request)
+        vm_rows = _build_vm_rows(virtual_machines)
+        vm_online = sum(1 for row in vm_rows if row['is_online'])
+
+        services = list(ServiceMonitor.objects.all())
+        service_summary = _service_summary(services)
+
         return render(
             request,
             'netbox_monitor/monitor.html',
@@ -831,8 +921,105 @@ class MonitorView(View):
                 'online': online,
                 'offline': len(rows) - online,
                 'incidents': incidents,
+                'vm_rows': vm_rows,
+                'vm_total': len(vm_rows),
+                'vm_online': vm_online,
+                'vm_offline': len(vm_rows) - vm_online,
+                'service_summary': service_summary,
             },
         )
+
+
+class ServicesView(LoginRequiredMixin, View):
+    template_name = 'netbox_monitor/services.html'
+
+    def get(self, request):
+        plugin_config = apps.get_app_config('netbox_monitor')
+        services = list(
+            ServiceMonitor.objects.select_related('virtual_machine').order_by(
+                'name'
+            )
+        )
+        for service in services:
+            service.ssl_badge = _ssl_badge_class(service.ssl_days_remaining)
+        form = ServiceMonitorForm()
+        return render(
+            request,
+            self.template_name,
+            {
+                'plugin_name': plugin_config.verbose_name,
+                'plugin_version': plugin_config.version,
+                'services': services,
+                'summary': _service_summary(services),
+                'form': form,
+            },
+        )
+
+    def post(self, request):
+        action = request.POST.get('action', 'add')
+
+        if action == 'add':
+            form = ServiceMonitorForm(request.POST)
+            if not form.is_valid():
+                messages.error(
+                    request,
+                    _('Não foi possível adicionar o serviço. Verifique os campos.'),
+                )
+            else:
+                service = form.save()
+                try:
+                    check_service_and_save(service)
+                    messages.success(
+                        request,
+                        _('Serviço "{name}" adicionado e testado: {status}.').format(
+                            name=service.name,
+                            status=service.last_status,
+                        ),
+                    )
+                except Exception as exc:
+                    messages.warning(
+                        request,
+                        _('Serviço "{name}" adicionado, mas o teste falhou: {error}').format(
+                            name=service.name,
+                            error=exc,
+                        ),
+                    )
+        elif action == 'delete':
+            service = get_object_or_404(
+                ServiceMonitor, pk=request.POST.get('service_id')
+            )
+            name = service.name
+            service.delete()
+            messages.success(
+                request,
+                _('Serviço "{name}" removido.').format(name=name),
+            )
+        elif action == 'test':
+            service = get_object_or_404(
+                ServiceMonitor, pk=request.POST.get('service_id')
+            )
+            try:
+                check_service_and_save(service)
+                messages.success(
+                    request,
+                    _('Teste de "{name}" concluído: {status}.').format(
+                        name=service.name,
+                        status=service.last_status,
+                    ),
+                )
+            except Exception as exc:
+                messages.error(
+                    request,
+                    _('Falha ao testar "{name}": {error}').format(
+                        name=service.name,
+                        error=exc,
+                    ),
+                )
+        elif action == 'test_all':
+            check_all_services()
+            messages.success(request, _('Todos os serviços foram testados.'))
+
+        return redirect(reverse('plugins:netbox_monitor:services'))
 
 
 class ExportNocCsvView(View):
@@ -1638,6 +1825,52 @@ class NocTvDashboardView(LoginRequiredMixin, View):
             reverse=True,
         )[:8]
 
+        services = list(
+            ServiceMonitor.objects.select_related('virtual_machine').order_by(
+                'name'
+            )
+        )
+        service_rows = [
+            {
+                'name': str(service.name),
+                'url': service.url,
+                'status': service.last_status,
+                'http_code': service.http_code,
+                'response_time_ms': service.response_time_ms,
+                'ssl_days_remaining': service.ssl_days_remaining,
+                'ssl_badge': _ssl_badge_class(service.ssl_days_remaining),
+                'virtual_machine': (
+                    str(service.virtual_machine)
+                    if service.virtual_machine_id else None
+                ),
+            }
+            for service in services
+        ]
+
+        vm_payload = [
+            {
+                'name': str(row['virtual_machine'].name),
+                'ip': row['ip'],
+                'cluster': row['cluster'],
+                'status': row['status'],
+                'cpu': row['cpu_percent'],
+                'memory': row['memory_percent'],
+                'latency_ms': row['latency_ms'],
+                'uptime': row['uptime'],
+                'has_metric': row['has_metric'],
+            }
+            for row in _build_vm_rows(_monitored_virtual_machines(request))
+        ]
+        vm_summary = {
+            'total': len(vm_payload),
+            'online': sum(
+                1 for row in vm_payload if row['status'] == 'ONLINE'
+            ),
+            'offline': sum(
+                1 for row in vm_payload if row['status'] == 'OFFLINE'
+            ),
+        }
+
         noc_data = {
             'generated_at': timezone.localtime(now).strftime('%d/%m/%Y %H:%M:%S'),
             'filters': {
@@ -1672,6 +1905,10 @@ class NocTvDashboardView(LoginRequiredMixin, View):
             'latency_bars': latency_bars,
             'devices': device_rows,
             'top_devices': top_devices,
+            'services': service_rows,
+            'service_summary': _service_summary(services),
+            'virtual_machines': vm_payload,
+            'vm_summary': vm_summary,
             'alerts_hour': _tv_alerts_by_hour(events, now),
             'incidents': _tv_incident_payload(events[:50]),
         }

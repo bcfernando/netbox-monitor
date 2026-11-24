@@ -5,6 +5,7 @@ from . import views
 urlpatterns = [
     path('', views.MonitorView.as_view(), name='monitor'),
     path('settings/', views.MonitorSettingsView.as_view(), name='settings'),
+    path('services/', views.ServicesView.as_view(), name='services'),
     path('topology/', views.TopologyView.as_view(), name='topology'),
     path('topology/sync-cables/', views.SyncLldpCablesView.as_view(), name='topology_sync_cables'),
     path('collect-all/', views.CollectAllView.as_view(), name='collect_all'),

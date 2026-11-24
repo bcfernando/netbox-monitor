@@ -19,6 +19,9 @@
         <a href="{% url 'plugins:netbox_monitor:export_csv' %}" class="btn btn-sm btn-outline-secondary">
           <i class="mdi mdi-download"></i> {% trans "Exportar CSV" %}
         </a>
+        <a href="{% url 'plugins:netbox_monitor:services' %}" class="btn btn-sm btn-outline-secondary">
+          <i class="mdi mdi-web-check"></i> {% trans "Serviços & SSL" %}
+        </a>
         <a href="{% url 'plugins:netbox_monitor:topology' %}" class="btn btn-sm btn-outline-secondary">
           <i class="mdi mdi-sitemap-outline"></i> {% trans "Topologia" %}
         </a>
@@ -62,7 +65,23 @@
     </div>
   </div>
 
-  <div class="card">
+  <ul class="nav nav-tabs" role="tablist">
+    <li class="nav-item" role="presentation">
+      <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-devices" type="button" role="tab">
+        <i class="mdi mdi-switch"></i> {% trans "Dispositivos" %}
+      </button>
+    </li>
+    <li class="nav-item" role="presentation">
+      <button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-vms" type="button" role="tab">
+        <i class="mdi mdi-server"></i> {% trans "Virtual Machines" %}
+        <span class="badge text-bg-secondary">{{ vm_total }}</span>
+      </button>
+    </li>
+  </ul>
+
+  <div class="tab-content">
+  <div class="tab-pane fade show active" id="tab-devices" role="tabpanel">
+  <div class="card border-top-0">
     <h5 class="card-header">{% trans "Dispositivos monitorados" %}</h5>
     <div class="table-responsive">
       <table class="table table-hover align-middle mb-0">
@@ -147,6 +166,67 @@
         </tbody>
       </table>
     </div>
+  </div>
+  </div>
+  <div class="tab-pane fade" id="tab-vms" role="tabpanel">
+    <div class="card border-top-0">
+      <h5 class="card-header">{% trans "Virtual Machines monitoradas" %}</h5>
+      <div class="table-responsive">
+        <table class="table table-hover align-middle mb-0">
+          <thead>
+            <tr>
+              <th>{% trans "VM" %}</th>
+              <th>{% trans "Cluster" %}</th>
+              <th>{% trans "IP primário" %}</th>
+              <th>{% trans "Status" %}</th>
+              <th>{% trans "CPU" %}</th>
+              <th>{% trans "Memória" %}</th>
+              <th>{% trans "Uptime" %}</th>
+              <th>{% trans "Latência" %}</th>
+              <th>{% trans "Última coleta" %}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in vm_rows %}
+              <tr>
+                <td><a href="{{ row.virtual_machine.get_absolute_url }}">{{ row.virtual_machine }}</a></td>
+                <td>{{ row.cluster }}</td>
+                <td><code>{{ row.ip|default:"—" }}</code></td>
+                <td>
+                  {% if row.status == 'ONLINE' %}
+                    <span class="badge text-bg-success text-white">ONLINE</span>
+                  {% elif row.status == 'OFFLINE' %}
+                    <span class="badge text-bg-danger text-white">OFFLINE</span>
+                  {% else %}
+                    <span class="badge text-bg-secondary text-white">PENDING</span>
+                  {% endif %}
+                </td>
+                <td>
+                  {% if row.cpu_percent is not None %}{{ row.cpu_percent|floatformat:1 }}%{% else %}—{% endif %}
+                </td>
+                <td>
+                  {% if row.memory_percent is not None %}{{ row.memory_percent|floatformat:1 }}%{% else %}—{% endif %}
+                </td>
+                <td>{% if row.has_metric %}{{ row.uptime }}{% else %}—{% endif %}</td>
+                <td>
+                  {% if row.latency_ms is not None %}{{ row.latency_ms|floatformat:2 }} ms{% else %}—{% endif %}
+                </td>
+                <td>
+                  {% if row.last_checked %}{{ row.last_checked|date:"d/m/Y H:i:s" }}{% else %}—{% endif %}
+                </td>
+              </tr>
+            {% empty %}
+              <tr>
+                <td colspan="9" class="text-center text-muted py-4">
+                  {% trans "Nenhuma máquina virtual com IP primário encontrada." %}
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
   </div>
 
   <div class="card mt-3">

@@ -3,19 +3,30 @@ import json
 import logging
 import os
 import re
+import socket
+import ssl
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
+from urllib.parse import urlparse
 
 from dcim.models import Device, Interface
 from django.db import close_old_connections
+from django.db.models import Q
 from django.utils import timezone
 from netbox.jobs import JobRunner, system_job
+from virtualization.models import VirtualMachine
 
-from .models import DeviceMetric, MonitorSettings
+from .models import (
+    DeviceMetric,
+    MonitorSettings,
+    ServiceMonitor,
+    VirtualMachineMetric,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +117,10 @@ NEIGHBOR_COLLECTION_TIMEOUT = 6
 FAST_PING_INTERVAL = 5
 FAST_PING_MAX_WORKERS = 32
 _FAST_PING_LOCK_KEY = 0x4E42504D
+SERVICE_TIMEOUT = 5
+SERVICE_SSL_WARN_DAYS = 15
+SERVICE_SSL_ALERT_INTERVAL = timedelta(hours=24)
+VM_MAX_WORKERS = 16
 
 ENTITY_SENSOR_TYPE_CELSIUS = 8
 ENTITY_SENSOR_TYPE_RPM = 10
@@ -1301,7 +1316,10 @@ def cleanup_old_metrics():
 
     cutoff = timezone.now() - timedelta(days=retention_days)
     deleted, _ = DeviceMetric.objects.filter(timestamp__lt=cutoff).delete()
-    return deleted
+    vm_deleted, _ = (
+        VirtualMachineMetric.objects.filter(timestamp__lt=cutoff).delete()
+    )
+    return deleted + vm_deleted
 
 
 def save_metric(device, data):
@@ -1318,6 +1336,276 @@ def save_metric(device, data):
         loop_status=data.get('loop_status', {}),
         hardware_metrics=data.get('hardware_metrics', {}),
     )
+
+
+def save_vm_metric(virtual_machine, data):
+    return VirtualMachineMetric.objects.create(
+        virtual_machine=virtual_machine,
+        is_online=data.get('is_online', False),
+        latency_ms=data.get('latency_ms'),
+        sys_descr=data.get('sys_descr'),
+        uptime_seconds=data.get('uptime_seconds'),
+        cpu_percent=data.get('cpu_percent'),
+        memory_percent=data.get('memory_percent'),
+        interfaces_summary=data.get('interfaces_summary', []),
+        vlans_summary=data.get('vlans_summary', []),
+        loop_status=data.get('loop_status', {}),
+        hardware_metrics=data.get('hardware_metrics', {}),
+    )
+
+
+def _vm_community(virtual_machine):
+    return (
+        (virtual_machine.custom_field_data or {}).get('snmp_community')
+        or 'public'
+    )
+
+
+def collect_virtual_machines(job_logger=None):
+    """Coleta ping + SNMP das VMs do NetBox com IP primário."""
+    log = job_logger or logger
+    virtual_machines = list(
+        VirtualMachine.objects.filter(
+            Q(primary_ip4__isnull=False) | Q(primary_ip6__isnull=False),
+            status='active',
+        )
+        .select_related('primary_ip4', 'primary_ip6')
+        .distinct()
+        .order_by('name')
+    )
+
+    targets = []
+    for virtual_machine in virtual_machines:
+        if virtual_machine.primary_ip is None:
+            continue
+        ip = str(virtual_machine.primary_ip.address).split('/')[0]
+        targets.append((virtual_machine, ip, _vm_community(virtual_machine)))
+
+    if not targets:
+        return 0
+
+    log.info(
+        f'Coletando métricas de {len(targets)} máquina(s) virtual(is) '
+        f'(até {VM_MAX_WORKERS} simultâneos)'
+    )
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=VM_MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(collect_device, ip, community): virtual_machine
+            for virtual_machine, ip, community in targets
+        }
+        for future in as_completed(futures):
+            virtual_machine = futures[future]
+            try:
+                results[virtual_machine.pk] = future.result()
+            except Exception as exc:
+                log.warning(
+                    f'Falha ao coletar VM {virtual_machine}: {exc}'
+                )
+            finally:
+                close_old_connections()
+
+    collected = 0
+    for virtual_machine, ip, _community in targets:
+        data = results.get(virtual_machine.pk)
+        if data is None:
+            continue
+        save_vm_metric(virtual_machine, data)
+        collected += 1
+        status = 'ONLINE' if data.get('is_online') else 'OFFLINE'
+        log.info(f'VM {virtual_machine} ({ip}): {status}')
+
+    return collected
+
+
+def _service_ssl_expiry(url):
+    parsed = urlparse(url)
+    if parsed.scheme != 'https' or not parsed.hostname:
+        return None, None
+
+    hostname = parsed.hostname
+    port = parsed.port or 443
+    context = ssl.create_default_context()
+    try:
+        with socket.create_connection(
+            (hostname, port), timeout=SERVICE_TIMEOUT
+        ) as raw_socket:
+            with context.wrap_socket(raw_socket, server_hostname=hostname) as sock:
+                certificate = sock.getpeercert()
+    except Exception as exc:
+        return None, str(exc)
+
+    not_after = (certificate or {}).get('notAfter')
+    if not not_after:
+        return None, None
+    try:
+        expires_at = datetime.strptime(
+            not_after, '%b %d %H:%M:%S %Y %Z'
+        ).replace(tzinfo=dt_timezone.utc)
+    except ValueError:
+        return None, None
+    days_remaining = (expires_at - timezone.now()).days
+    return expires_at, days_remaining
+
+
+def check_service(url, expected_keyword=''):
+    """Testa uma URL e retorna status, código HTTP, latência e SSL."""
+    started = time.monotonic()
+    data = {
+        'last_status': 'OFFLINE',
+        'http_code': None,
+        'response_time_ms': None,
+        'ssl_days_remaining': None,
+        'ssl_expires_at': None,
+        'last_error': '',
+    }
+
+    body = ''
+    request = urllib.request.Request(
+        url,
+        headers={'User-Agent': 'NetBox-Monitor/1.0'},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=SERVICE_TIMEOUT) as response:
+            data['http_code'] = response.status
+            body = response.read(200_000).decode('utf-8', errors='ignore')
+    except urllib.error.HTTPError as exc:
+        data['http_code'] = exc.code
+        data['last_error'] = f'HTTP {exc.code}'
+    except Exception as exc:
+        data['last_error'] = str(exc)
+
+    data['response_time_ms'] = round((time.monotonic() - started) * 1000, 2)
+
+    if urlparse(url).scheme == 'https':
+        expires_at, ssl_result = _service_ssl_expiry(url)
+        if expires_at is not None:
+            data['ssl_expires_at'] = expires_at
+            data['ssl_days_remaining'] = ssl_result
+        elif ssl_result and not data['last_error']:
+            data['last_error'] = f'SSL: {ssl_result}'
+
+    http_ok = (
+        data['http_code'] is not None
+        and 200 <= data['http_code'] <= 299
+    )
+    keyword_ok = (
+        not expected_keyword
+        or expected_keyword.lower() in body.lower()
+    )
+    if http_ok and keyword_ok:
+        data['last_status'] = 'ONLINE'
+        data['last_error'] = ''
+    elif http_ok and not keyword_ok:
+        data['last_error'] = (
+            f'Palavra-chave "{expected_keyword}" não encontrada na resposta.'
+        )
+
+    return data
+
+
+def _apply_service_result(service, data):
+    service.last_status = data['last_status']
+    service.http_code = data['http_code']
+    service.response_time_ms = data['response_time_ms']
+    service.ssl_days_remaining = data['ssl_days_remaining']
+    service.ssl_expires_at = data['ssl_expires_at']
+    service.last_error = data['last_error'] or ''
+    service.last_checked = timezone.now()
+    service.save(update_fields=[
+        'last_status',
+        'http_code',
+        'response_time_ms',
+        'ssl_days_remaining',
+        'ssl_expires_at',
+        'last_error',
+        'last_checked',
+    ])
+
+
+def _service_alerts(service, previous_status):
+    now = timezone.now()
+    alerts = []
+
+    if previous_status == 'ONLINE' and service.last_status == 'OFFLINE':
+        alerts.append(
+            f'🔴 <b>SERVIÇO OFFLINE</b>\n'
+            f'Serviço: {service.name}\n'
+            f'URL: {service.url}'
+        )
+    elif previous_status == 'OFFLINE' and service.last_status == 'ONLINE':
+        alerts.append(
+            f'🟢 <b>SERVIÇO RECUPERADO</b>\n'
+            f'Serviço: {service.name}\n'
+            f'URL: {service.url}'
+        )
+
+    days = service.ssl_days_remaining
+    if days is not None and days <= SERVICE_SSL_WARN_DAYS:
+        last_alert = service.last_ssl_alert_at
+        if last_alert is None or now - last_alert >= SERVICE_SSL_ALERT_INTERVAL:
+            alerts.append(
+                f'🔒 <b>CERTIFICADO SSL PRÓXIMO DO VENCIMENTO</b>\n'
+                f'Serviço: {service.name}\n'
+                f'URL: {service.url}\n'
+                f'Dias restantes: {days}'
+            )
+            service.last_ssl_alert_at = now
+            service.save(update_fields=['last_ssl_alert_at'])
+
+    for message in alerts:
+        send_webhook_alert(message)
+    return len(alerts)
+
+
+def check_service_and_save(service):
+    previous_status = service.last_status
+    data = check_service(service.url, service.expected_keyword)
+    _apply_service_result(service, data)
+    _service_alerts(service, previous_status)
+    return service
+
+
+def check_all_services():
+    """Verifica em paralelo todos os serviços HTTP/HTTPS ativos."""
+    services = list(ServiceMonitor.objects.filter(is_active=True))
+    if not services:
+        return {'checked': 0, 'online': 0, 'offline': 0}
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=COLLECT_MAX_WORKERS) as executor:
+        futures = {
+            executor.submit(
+                check_service, service.url, service.expected_keyword
+            ): service
+            for service in services
+        }
+        for future in as_completed(futures):
+            service = futures[future]
+            try:
+                results[service.pk] = future.result()
+            except Exception as exc:
+                logger.warning(f'Falha ao verificar {service}: {exc}')
+            finally:
+                close_old_connections()
+
+    online = 0
+    for service in services:
+        data = results.get(service.pk)
+        if data is None:
+            continue
+        previous_status = service.last_status
+        _apply_service_result(service, data)
+        _service_alerts(service, previous_status)
+        if service.last_status == 'ONLINE':
+            online += 1
+
+    return {
+        'checked': len(services),
+        'online': online,
+        'offline': len(services) - online,
+    }
 
 
 @system_job(interval=1)
@@ -1385,6 +1673,18 @@ class DeviceMonitorJob(JobRunner):
                 f'{device} ({ip}): {status} '
                 f'{latency_ms if latency_ms is not None else "-"} ms'
             )
+
+        try:
+            collected = collect_virtual_machines(self.logger)
+            self.logger.info(f'Máquinas virtuais coletadas: {collected}')
+        except Exception as exc:
+            self.logger.warning(f'Falha na coleta de máquinas virtuais: {exc}')
+
+        try:
+            service_stats = check_all_services()
+            self.logger.info(f'Serviços & SSL: {service_stats}')
+        except Exception as exc:
+            self.logger.warning(f'Falha na verificação de serviços: {exc}')
 
         deleted = cleanup_old_metrics()
         self.logger.info(f'Limpeza de histórico: {deleted} registro(s) removido(s)')
